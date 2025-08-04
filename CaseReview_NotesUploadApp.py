@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
 import msal
-import xlsxwriter
+from openpyxl import Workbook
 
 # === ENVIRONMENT VARIABLES ===
 CLIO_CLIENT_ID = os.getenv("CLIO_CLIENT_ID")
@@ -57,14 +57,14 @@ def fetch_custom_fields():
     resp.raise_for_status()
     return {f.get("field_name", f.get("name")): f["id"] for f in resp.json().get("data", []) if isinstance(f, dict)}
 
-def fetch_all_matters():
+def fetch_open_matters():
     token = get_clio_token()
     matters = []
     page = 1
     while True:
         resp = requests.get(f"https://app.clio.com/api/v{API_VERSION}/matters.json",
             headers={"Authorization": f"Bearer {token}"},
-            params={"page": page, "limit": 200, "status": "open,pending",
+            params={"page": page, "limit": 200, "status": "open",
                     "fields": "id,number,client{name},matter_stage{name},responsible_attorney{name},custom_field_values"})
         resp.raise_for_status()
         data = resp.json().get("data", [])
@@ -107,31 +107,29 @@ def upload_file(file_path, file_name, folder_path):
 # === DATA PROCESSING ===
 def extract_custom_data():
     fields = fetch_custom_fields()
-    matters = fetch_all_matters()
+    matters = fetch_open_matters()
     file_path = "/tmp/case_review.xlsx"
 
-    with xlsxwriter.Workbook(file_path, {'constant_memory': True}) as workbook:
-        worksheet = workbook.add_worksheet("Case Review")
-        header_format = workbook.add_format({'bold': True})
-        for col_num, header in enumerate(OUTPUT_FIELDS):
-            worksheet.write(0, col_num, header, header_format)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Case Review"
 
-        row_num = 1
-        for m in matters:
-            cfields = m.get("custom_field_values", [])
-            custom_map = {cf.get("field_name"): cf.get("value") or cf.get("picklist_option", {}).get("option", "") for cf in cfields if isinstance(cf, dict)}
-            row = {
-                "Matter Number": m.get("number", ""),
-                "Client Name": m.get("client", {}).get("name", ""),
-                "Matter Stage": m.get("matter_stage", {}).get("name", ""),
-                "Responsible Attorney": m.get("responsible_attorney", {}).get("name", "")
-            }
-            row.update({key: custom_map.get(key, '') for key in OUTPUT_FIELDS if key not in row})
-            row["Net Trust Account Balance"] = 0
-            for col_num, key in enumerate(OUTPUT_FIELDS):
-                worksheet.write(row_num, col_num, row.get(key, ''))
-            row_num += 1
+    ws.append(OUTPUT_FIELDS)
 
+    for m in matters:
+        cfields = m.get("custom_field_values", [])
+        custom_map = {cf.get("field_name"): cf.get("value") or cf.get("picklist_option", {}).get("option", "") for cf in cfields if isinstance(cf, dict)}
+        row = {
+            "Matter Number": m.get("number", ""),
+            "Client Name": m.get("client", {}).get("name", ""),
+            "Matter Stage": m.get("matter_stage", {}).get("name", ""),
+            "Responsible Attorney": m.get("responsible_attorney", {}).get("name", "")
+        }
+        row.update({key: custom_map.get(key, '') for key in OUTPUT_FIELDS if key not in row})
+        row["Net Trust Account Balance"] = 0
+        ws.append([row.get(key, '') for key in OUTPUT_FIELDS])
+
+    wb.save(file_path)
     return file_path
 
 def main():
