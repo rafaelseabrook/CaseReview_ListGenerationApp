@@ -62,11 +62,15 @@ def get_latest_excel_from_folder(graph_token, folder_path):
 # === FETCH CUSTOM FIELDS ===
 def get_clio_custom_fields():
     headers = {"Authorization": f"Bearer {CLIO_ACCESS_TOKEN}"}
-    url = "https://app.clio.com/api/v4/custom_fields.json"
+    url = "https://app.clio.com/api/v4/custom_fields.json?limit=200"
     res = requests.get(url, headers=headers)
     res.raise_for_status()
-    fields = res.json().get("data", [])
-    return {f['name']: f['id'] for f in fields if f['name'] in TARGET_FIELDS}
+    records = res.json().get("data", [])
+    mapping = {}
+    for item in records:
+        if isinstance(item, dict) and item.get("name") in TARGET_FIELDS:
+            mapping[item["name"]] = item["id"]
+    return mapping
 
 # === UPDATE MATTER ===
 def update_custom_fields_for_matter(matter_id, updates):
