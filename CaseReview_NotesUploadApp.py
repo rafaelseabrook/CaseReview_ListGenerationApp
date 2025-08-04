@@ -69,14 +69,18 @@ def get_clio_custom_fields():
 def find_matter_id_by_number(matter_number):
     headers = {"Authorization": f"Bearer {CLIO_ACCESS_TOKEN}"}
     url = "https://app.clio.com/api/v4/matters.json"
-    params = {"query": matter_number}
+    params = {"query": matter_number, "fields": "id,display_number"}
     res = requests.get(url, headers=headers, params=params)
     res.raise_for_status()
     matches = res.json().get("data", [])
+    print(f"Query: '{matter_number}' — {len(matches)} matches returned")
     for m in matches:
-        if str(m.get("number")) == str(matter_number):
+        dn = m.get("display_number") or m.get("number")
+        print(f"  Match: id={m.get('id')}, display_number={dn}")
+        if str(dn).strip() == matter_number.strip():
             return m["id"]
     return None
+
 
 # === GET FIELD INSTANCE IDS FOR A MATTER ===
 def get_field_instances(matter_id):
