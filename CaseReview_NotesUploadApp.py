@@ -119,6 +119,7 @@ def extract_custom_data():
             "Responsible Attorney": m.get("responsible_attorney", {}).get("name", "")
         }
         row.update({key: custom_map.get(key, '') for key in OUTPUT_FIELDS if key not in row})
+        row["Net Trust Account Balance"] = 0  # Default for this version
         data.append(row)
 
     df = pd.DataFrame(data)
