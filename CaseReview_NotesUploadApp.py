@@ -13,12 +13,12 @@ CLIO_ACCESS_TOKEN = os.getenv("CLIO_ACCESS_TOKEN")
 CLIO_EXPIRES_IN = float(os.getenv("CLIO_EXPIRES_IN", 0))
 CLIO_REDIRECT_URI = os.getenv("CLIO_REDIRECT_URI")
 
-SHAREPOINT_TENANT_ID = os.getenv("SHAREPOINT_TENANT_ID")
-SHAREPOINT_CLIENT_ID = os.getenv("SHAREPOINT_CLIENT_ID")
-SHAREPOINT_CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
+SHAREPOINT_TENANT_ID = os.getenv("GRAPH_TENANT_ID")
+SHAREPOINT_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
+SHAREPOINT_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
 SHAREPOINT_SITE_ID = os.getenv("SHAREPOINT_SITE_ID")
 SHAREPOINT_DRIVE_ID = os.getenv("SHAREPOINT_DRIVE_ID")
-SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB").strip('"')
+SHAREPOINT_DOC_LIB = "General Management/Global Case Review Lists"
 
 API_VERSION = '4'
 OUTPUT_FIELDS = [
@@ -88,7 +88,7 @@ def ensure_folder(path, headers):
             create.raise_for_status()
         parent = full
 
-def upload_file(file_path, file_name, attorney_folder):
+def upload_file(file_path, file_name, folder_path):
     authority = f"https://login.microsoftonline.com/{SHAREPOINT_TENANT_ID}"
     app = msal.ConfidentialClientApplication(SHAREPOINT_CLIENT_ID, authority=authority, client_credential=SHAREPOINT_CLIENT_SECRET)
     tok = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
@@ -96,13 +96,10 @@ def upload_file(file_path, file_name, attorney_folder):
         raise Exception("Failed to get Graph token")
     headers = {"Authorization": f"Bearer {tok['access_token']}"}
 
-    today = datetime.now()
-    folder_path = f"{SHAREPOINT_DOC_LIB}/{today.year}/{today.strftime('%m %B %Y')}/{attorney_folder}"
     ensure_folder(folder_path, headers)
-
     upload_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{quote(folder_path + '/' + file_name)}:/content"
     with open(file_path, "rb") as f:
-        res = requests.put(upload_url, headers={"Authorization": f"Bearer {tok['access_token']}"}, data=f)
+        res = requests.put(upload_url, headers=headers, data=f)
     if res.status_code not in (200, 201):
         raise Exception(f"Upload error: {res.text}")
 
@@ -132,14 +129,12 @@ def extract_custom_data():
 
 def main():
     df = extract_custom_data()
-    for attorney, group in df.groupby("Responsible Attorney"):
-        if not attorney:
-            continue
-        file_name = f"Case Review - {attorney}.xlsx"
-        file_path = f"/tmp/{file_name}"
-        group.to_excel(file_path, index=False)
-        upload_file(file_path, file_name, attorney)
-        os.remove(file_path)
+    file_date = datetime.now().strftime("%y%m%d")
+    file_name = f"{file_date}.Seabrook's Case Review List.xlsx"
+    file_path = f"/tmp/{file_name}"
+    df.to_excel(file_path, index=False)
+    upload_file(file_path, file_name, SHAREPOINT_DOC_LIB)
+    os.remove(file_path)
 
 if __name__ == '__main__':
     main()
