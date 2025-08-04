@@ -11,9 +11,6 @@ CLIENT_ID = os.getenv("SHAREPOINT_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
 SITE_ID = os.getenv("SHAREPOINT_SITE_ID")
 DRIVE_ID = os.getenv("SHAREPOINT_DRIVE_ID")
-CLIO_CLIENT_ID = os.getenv("CLIO_CLIENT_ID")
-CLIO_CLIENT_SECRET = os.getenv("CLIO_CLIENT_SECRET")
-CLIO_REDIRECT_URI = os.getenv("CLIO_REDIRECT_URI")
 CLIO_ACCESS_TOKEN = os.getenv("CLIO_ACCESS_TOKEN")
 
 # === CONSTANTS ===
@@ -59,39 +56,14 @@ def get_latest_excel_from_folder(graph_token, folder_path):
     content = requests.get(download_url)
     return BytesIO(content.content)
 
-# === FETCH CUSTOM FIELDS ===
+# === FETCH CUSTOM FIELD DEFINITIONS ===
 def get_clio_custom_fields():
     headers = {"Authorization": f"Bearer {CLIO_ACCESS_TOKEN}"}
     url = "https://app.clio.com/api/v4/custom_fields.json?limit=200"
     res = requests.get(url, headers=headers)
     res.raise_for_status()
     records = res.json().get("data", [])
-    mapping = {}
-    for item in records:
-        if isinstance(item, dict) and item.get("name") in TARGET_FIELDS:
-            mapping[item["name"]] = item["id"]
-    return mapping
-
-# === UPDATE MATTER ===
-def update_custom_fields_for_matter(matter_id, updates):
-    headers = {
-        "Authorization": f"Bearer {CLIO_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    for field_id, value in updates.items():
-        url = f"https://app.clio.com/api/v4/custom_field_values.json"
-        data = {
-            "custom_field_value": {
-                "custom_field_id": field_id,
-                "value": value,
-                "field_type": "text",
-                "resource_type": "Matter",
-                "resource_id": matter_id
-            }
-        }
-        res = requests.post(url, headers=headers, json=data)
-        if res.status_code not in [200, 201]:
-            print(f"Failed to update field {field_id} on matter {matter_id}: {res.text}")
+    return {item["name"]: item["id"] for item in records if item.get("name") in TARGET_FIELDS}
 
 # === FIND MATTER BY NUMBER ===
 def find_matter_id_by_number(matter_number):
@@ -105,6 +77,38 @@ def find_matter_id_by_number(matter_number):
         if str(m.get("number")) == str(matter_number):
             return m["id"]
     return None
+
+# === GET FIELD INSTANCE IDS FOR A MATTER ===
+def get_field_instances(matter_id):
+    headers = {"Authorization": f"Bearer {CLIO_ACCESS_TOKEN}"}
+    url = f"https://app.clio.com/api/v4/matters/{matter_id}.json?fields=custom_field_values"
+    res = requests.get(url, headers=headers)
+    res.raise_for_status()
+    values = res.json().get("data", {}).get("custom_field_values", [])
+    return {v['custom_field']['id']: v['id'] for v in values if 'custom_field' in v and 'id' in v}
+
+# === UPDATE CUSTOM FIELDS ===
+def update_custom_fields_for_matter(matter_id, updates):
+    headers = {
+        "Authorization": f"Bearer {CLIO_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    instance_map = get_field_instances(matter_id)
+    payload = {
+        "data": {
+            "custom_field_values": [
+                {
+                    "id": instance_map[field_id],
+                    "custom_field": {"id": field_id},
+                    "value": value
+                } for field_id, value in updates.items() if field_id in instance_map
+            ]
+        }
+    }
+    url = f"https://app.clio.com/api/v4/matters/{matter_id}.json"
+    res = requests.patch(url, headers=headers, json=payload)
+    if res.status_code not in [200, 201]:
+        print(f"Failed to update matter {matter_id}: {res.text}")
 
 # === MAIN PROCESS ===
 def process_attorney_case_files():
@@ -132,6 +136,9 @@ def process_attorney_case_files():
                 print(f"Updated matter {matter_number} with custom fields.")
         except Exception as e:
             print(f"Error processing {name}: {e}")
+
+if __name__ == "__main__":
+    process_attorney_case_files()
 
 if __name__ == "__main__":
     process_attorney_case_files()
