@@ -161,6 +161,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-if __name__ == "__main__":
-    process_attorney_case_files()
