@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
 import msal
+import xlsxwriter
 
 # === ENVIRONMENT VARIABLES ===
 CLIO_CLIENT_ID = os.getenv("CLIO_CLIENT_ID")
@@ -107,33 +108,36 @@ def upload_file(file_path, file_name, folder_path):
 def extract_custom_data():
     fields = fetch_custom_fields()
     matters = fetch_all_matters()
-    data = []
+    file_path = "/tmp/case_review.xlsx"
 
-    for m in matters:
-        cfields = m.get("custom_field_values", [])
-        custom_map = {cf.get("field_name"): cf.get("value") or cf.get("picklist_option", {}).get("option", "") for cf in cfields if isinstance(cf, dict)}
-        row = {
-            "Matter Number": m.get("number", ""),
-            "Client Name": m.get("client", {}).get("name", ""),
-            "Matter Stage": m.get("matter_stage", {}).get("name", ""),
-            "Responsible Attorney": m.get("responsible_attorney", {}).get("name", "")
-        }
-        row.update({key: custom_map.get(key, '') for key in OUTPUT_FIELDS if key not in row})
-        row["Net Trust Account Balance"] = 0  # Default for this version
-        data.append(row)
+    with xlsxwriter.Workbook(file_path, {'constant_memory': True}) as workbook:
+        worksheet = workbook.add_worksheet("Case Review")
+        header_format = workbook.add_format({'bold': True})
+        for col_num, header in enumerate(OUTPUT_FIELDS):
+            worksheet.write(0, col_num, header, header_format)
 
-    df = pd.DataFrame(data)
-    for col in OUTPUT_FIELDS:
-        if col not in df.columns:
-            df[col] = ''
-    return df[OUTPUT_FIELDS]
+        row_num = 1
+        for m in matters:
+            cfields = m.get("custom_field_values", [])
+            custom_map = {cf.get("field_name"): cf.get("value") or cf.get("picklist_option", {}).get("option", "") for cf in cfields if isinstance(cf, dict)}
+            row = {
+                "Matter Number": m.get("number", ""),
+                "Client Name": m.get("client", {}).get("name", ""),
+                "Matter Stage": m.get("matter_stage", {}).get("name", ""),
+                "Responsible Attorney": m.get("responsible_attorney", {}).get("name", "")
+            }
+            row.update({key: custom_map.get(key, '') for key in OUTPUT_FIELDS if key not in row})
+            row["Net Trust Account Balance"] = 0
+            for col_num, key in enumerate(OUTPUT_FIELDS):
+                worksheet.write(row_num, col_num, row.get(key, ''))
+            row_num += 1
+
+    return file_path
 
 def main():
-    df = extract_custom_data()
+    file_path = extract_custom_data()
     file_date = datetime.now().strftime("%y%m%d")
     file_name = f"{file_date}.Seabrook's Case Review List.xlsx"
-    file_path = f"/tmp/{file_name}"
-    df.to_excel(file_path, index=False)
     upload_file(file_path, file_name, SHAREPOINT_DOC_LIB)
     os.remove(file_path)
 
