@@ -571,7 +571,7 @@ def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
             continue
 
         # File name: e.g., 250808.Case Review - Voorhees, Elizabeth.xlsx
-        atty_file_name = f"{file_date}.Case Review - {atty}.xlsx"
+        atty_file_name = f"{file_date}.TESTCase Review - {atty}.xlsx"
 
         # Write to /tmp and upload
         tmp_dir = "/tmp"
@@ -605,7 +605,7 @@ def main():
     df, file_path = extract_custom_data_and_build_file()
 
     file_date = datetime.now().strftime("%y%m%d")
-    master_name = f"{file_date}.Seabrook's Case Review List.xlsx"
+    master_name = f"{file_date}.TESTSeabrook's Case Review List.xlsx"
 
     # 1) Upload the full master file to the Global Case Review List library/folder
     upload_file(file_path, master_name, SHAREPOINT_DOC_LIB)
