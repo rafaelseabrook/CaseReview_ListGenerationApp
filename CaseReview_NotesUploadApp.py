@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Case Review Report (fixed)
-- Correct Net Trust Account Balance (Trust - Outstanding - Unbilled)
+- Correct picklist names (no more numeric IDs for paralegals)
+- Adds Billing Cycle Hours (configurable date range) from Activities
+- Correct Net Trust Account Balance = Trust - Outstanding - Unbilled
 - Includes ALL open/pending matters
-- Stable joins by IDs; custom field *names* (picklist text) included
-- Rate-limit aware requests, 401 refresh, and proper pagination
-- Same color formatting & ordering as Traffic Light report
+- Same color formatting (traffic light) + sort by Net Trust desc
 """
 
 import os
 import re
 import time
-import shutil
 import requests
 import pandas as pd
 from datetime import datetime
@@ -22,25 +21,36 @@ from openpyxl.styles import PatternFill, Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 # ==============================
-# Environment / Config
+# Config (edit these 4 for billing cycle)
+# ==============================
+CYCLE_START_LABEL = "07/02/25"   # shown in column header
+CYCLE_END_LABEL   = "07/15/25"   # shown in column header
+CYCLE_START_DATE  = "2025-07-02" # used in Activities query
+CYCLE_END_DATE    = "2025-07-15" # used in Activities query
+TIMEZONE_OFFSET   = os.getenv("CLIO_TZ_OFFSET", "-08:00")  # used to build ISO times
+
+def cycle_iso(start_date: str, end_date: str, tz: str) -> tuple[str, str]:
+    return f"{start_date}T00:00:00{tz}", f"{end_date}T23:59:59{tz}"
+
+BILLING_COL = f"Billing Cycle Hours ({CYCLE_START_LABEL} - {CYCLE_END_LABEL})"
+
+# ==============================
+# Environment / Clio / Graph
 # ==============================
 API_VERSION = "4"
 CLIO_BASE = os.getenv("CLIO_BASE", "https://app.clio.com").rstrip("/")
 CLIO_API = f"{CLIO_BASE}/api/v{API_VERSION}"
 CLIO_TOKEN_URL = f"{CLIO_BASE}/oauth/token"
 
-# Clio OAuth (env-backed; uses refresh token)
 CLIO_CLIENT_ID = os.getenv("CLIO_CLIENT_ID")
 CLIO_CLIENT_SECRET = os.getenv("CLIO_CLIENT_SECRET")
-CLIO_REFRESH_TOKEN = os.getenv("CLIO_REFRESH_TOKEN")  # persisted in env
-CLIO_ACCESS_TOKEN = os.getenv("CLIO_ACCESS_TOKEN")     # ephemeral
-# Backward compat: read old EXPIRES_IN if present; prefer EXPIRES_AT
+CLIO_REFRESH_TOKEN = os.getenv("CLIO_REFRESH_TOKEN")
+_CLIO_ACCESS_TOKEN = os.getenv("CLIO_ACCESS_TOKEN") or ""
 _CLIO_EXPIRES_AT_ENV = os.getenv("CLIO_EXPIRES_AT") or os.getenv("CLIO_EXPIRES_IN")
 try:
-    CLIO_EXPIRES_AT = float(_CLIO_EXPIRES_AT_ENV) if _CLIO_EXPIRES_AT_ENV else 0.0
+    _CLIO_EXPIRES_AT = float(_CLIO_EXPIRES_AT_ENV) if _CLIO_EXPIRES_AT_ENV else 0.0
 except Exception:
-    CLIO_EXPIRES_AT = 0.0
-CLIO_REDIRECT_URI = os.getenv("CLIO_REDIRECT_URI")
+    _CLIO_EXPIRES_AT = 0.0
 
 # SharePoint / Graph
 SHAREPOINT_TENANT_ID = os.getenv("GRAPH_TENANT_ID")
@@ -48,52 +58,44 @@ SHAREPOINT_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
 SHAREPOINT_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
 SHAREPOINT_SITE_ID = os.getenv("SHAREPOINT_SITE_ID")
 SHAREPOINT_DRIVE_ID = os.getenv("SHAREPOINT_DRIVE_ID")
-SHAREPOINT_DOC_LIB = os.getenv(
-    "SHAREPOINT_DOC_LIB",
-    "General Management/Global Case Review Lists"
-)
+SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB", "General Management/Global Case Review Lists")
 
-# Report columns (kept as you provided)
+# ==============================
+# Output columns (exact order you requested)
+# ==============================
 OUTPUT_FIELDS = [
     "Matter Number","Client Name","CR ID","Net Trust Account Balance","Matter Stage",
-    "Responsible Attorney","Main Paralegal","Client Notes","Initial Client Goals","Initial Strategy",
-    "Has strategy changed Describe","Current action Items","Hearings","Deadlines","DV situation description",
-    "Custody Visitation","CS Add ons Extracurricular","Spousal Support","PDDs","Discovery",
-    "Judgment Trial","Post Judgment","collection efforts"
+    BILLING_COL,  # dynamic column
+    "Responsible Attorney","Main Paralegal","Supporting Attorney","Supporting Paralegal","Client Notes",
+    "Initial Client Goals","Initial Strategy","Has strategy changed Describe","Current action Items",
+    "Hearings","Deadlines","DV situation description","Custody Visitation","CS Add ons Extracurricular",
+    "Spousal Support","PDDs","Discovery","Judgment Trial","Post Judgment","collection efforts"
 ]
 
-# Rate limiting / pagination
+# ==============================
+# HTTP / Rate limiting
+# ==============================
 PAGE_LIMIT = 200
 GLOBAL_MIN_SLEEP = float(os.getenv("CLIO_GLOBAL_MIN_SLEEP_SEC", "0.25"))
 
 session = requests.Session()
 session.headers.update({"Accept": "application/json"})
 
-# ==============================
-# Auth Helpers (env-backed)
-# ==============================
 def _save_tokens_env(tokens: dict):
-    """
-    Persist ephemeral tokens in environment for the running process.
-    Preserve refresh_token if not returned.
-    """
-    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_AT, CLIO_REFRESH_TOKEN
-    CLIO_ACCESS_TOKEN = tokens.get("access_token", CLIO_ACCESS_TOKEN)
-    # Clio commonly does not return refresh_token on refresh; preserve prior
+    global _CLIO_ACCESS_TOKEN, _CLIO_EXPIRES_AT, CLIO_REFRESH_TOKEN
+    _CLIO_ACCESS_TOKEN = tokens.get("access_token", _CLIO_ACCESS_TOKEN)
     if tokens.get("refresh_token"):
         CLIO_REFRESH_TOKEN = tokens["refresh_token"]
         os.environ["CLIO_REFRESH_TOKEN"] = CLIO_REFRESH_TOKEN
-    # Convert expires_in -> expires_at
     expires_in = tokens.get("expires_in", 0)
     try:
-        CLIO_EXPIRES_AT = time.time() + float(expires_in)
+        _CLIO_EXPIRES_AT = time.time() + float(expires_in)
     except Exception:
-        CLIO_EXPIRES_AT = time.time() + 3000
-    os.environ["CLIO_ACCESS_TOKEN"] = CLIO_ACCESS_TOKEN or ""
-    os.environ["CLIO_EXPIRES_AT"] = str(CLIO_EXPIRES_AT)
+        _CLIO_EXPIRES_AT = time.time() + 3000
+    os.environ["CLIO_ACCESS_TOKEN"] = _CLIO_ACCESS_TOKEN or ""
+    os.environ["CLIO_EXPIRES_AT"] = str(_CLIO_EXPIRES_AT)
 
 def _refresh_clio_token() -> str:
-    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_AT, CLIO_REFRESH_TOKEN
     if not (CLIO_CLIENT_ID and CLIO_CLIENT_SECRET and CLIO_REFRESH_TOKEN):
         raise RuntimeError("Missing CLIO_CLIENT_ID/CLIO_CLIENT_SECRET/CLIO_REFRESH_TOKEN.")
     resp = session.post(CLIO_TOKEN_URL, data={
@@ -106,22 +108,19 @@ def _refresh_clio_token() -> str:
         raise RuntimeError(f"Token refresh failed: {resp.status_code} {resp.text[:200]}")
     tokens = resp.json() or {}
     _save_tokens_env(tokens)
-    return CLIO_ACCESS_TOKEN
+    return _CLIO_ACCESS_TOKEN
 
 def _get_clio_token() -> str:
-    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_AT
+    global _CLIO_ACCESS_TOKEN, _CLIO_EXPIRES_AT
     now = time.time()
-    if not CLIO_ACCESS_TOKEN or now >= (CLIO_EXPIRES_AT or 0):
+    if (not _CLIO_ACCESS_TOKEN) or now >= (_CLIO_EXPIRES_AT or 0):
         return _refresh_clio_token()
-    return CLIO_ACCESS_TOKEN
+    return _CLIO_ACCESS_TOKEN
 
 def _ensure_auth_header():
     token = _get_clio_token()
     session.headers["Authorization"] = f"Bearer {token}"
 
-# ==============================
-# Backoff / Request Wrapper
-# ==============================
 def _sleep_with_floor(start_ts: float, retry_after: int | float | None = None):
     elapsed = time.time() - start_ts
     base_wait = max(0, GLOBAL_MIN_SLEEP - elapsed)
@@ -136,16 +135,12 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
     for _ in range(max_tries):
         t0 = time.time()
         resp = session.request(method, url, timeout=60, **kwargs)
-
-        # Token expiry / auth issues -> refresh once per attempt
         if resp.status_code == 401:
             try:
                 _refresh_clio_token()
             finally:
                 _sleep_with_floor(t0, retry_after=1)
             continue
-
-        # Rate limit
         if resp.status_code == 429:
             ra = 30
             if resp.headers.get("Retry-After"):
@@ -161,65 +156,70 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
             print(f"[429] Rate limited. Waiting {ra}s …")
             _sleep_with_floor(t0, retry_after=ra)
             continue
-
-        # Server errors
         if 500 <= resp.status_code < 600:
             print(f"[{resp.status_code}] Server error. Retrying in {backoff}s …")
             _sleep_with_floor(t0, retry_after=backoff)
             backoff = min(backoff * 2, 60)
             continue
-
         _sleep_with_floor(t0)
         return resp
-    return resp  # last response (likely error)
+    return resp
 
-# ==============================
-# Proper Clio pagination (meta.paging.next)
-# ==============================
 def paginate(url: str, params: dict | None = None):
     params = dict(params or {})
     params.setdefault("limit", PAGE_LIMIT)
-    params.setdefault("order", "id(asc)")  # stable cursor pagination
-
+    params.setdefault("order", "id(asc)")
     next_url = url
     next_params = params
     all_rows = []
-
     while True:
         resp = _request("GET", next_url, params=next_params)
         print(f"GET {next_url} params={next_params} → {resp.status_code}")
         if resp.status_code != 200:
             print(f"Failed: {resp.status_code} {resp.text[:200]}")
             break
-
         body = resp.json() or {}
         rows = body.get("data", [])
         if isinstance(rows, list):
             all_rows.extend([r for r in rows if isinstance(r, dict)])
-
         paging = (body.get("meta") or {}).get("paging") or {}
         next_link = paging.get("next")
-
         if next_link:
             next_url = next_link
             next_params = None
             continue
-
-        # Fallback: stop when short page and no 'next'
         if len(rows) < params["limit"]:
             break
         else:
-            break  # avoid accidental infinite loop
-
+            break
     return all_rows
 
 # ==============================
-# Clio data fetchers
+# Clio fetchers
 # ==============================
+def fetch_custom_fields_meta():
+    """
+    Returns:
+      { field_name: { 'id': int, 'type': str, 'options': {str(option_id): option_text } } }
+    """
+    url = f"{CLIO_API}/custom_fields.json"
+    params = {"fields": "id,name,field_type,picklist_options"}
+    rows = paginate(url, params)
+    out = {}
+    for f in rows:
+        name = f.get("name")
+        if not name:
+            continue
+        opts = {}
+        for opt in (f.get("picklist_options") or []):
+            oid = opt.get("id")
+            text = opt.get("option")
+            if oid is not None:
+                opts[str(oid)] = text
+        out[name] = {"id": f.get("id"), "type": f.get("field_type"), "options": opts}
+    return out
+
 def fetch_open_matters_with_cf():
-    """
-    Matters with account balances and required headers + custom fields.
-    """
     url = f"{CLIO_API}/matters.json"
     fields = (
         "id,display_number,number,"
@@ -233,24 +233,49 @@ def fetch_open_matters_with_cf():
     return paginate(url, params)
 
 def fetch_outstanding_client_balances():
-    """
-    Outstanding AR per client (contact).
-    """
     url = f"{CLIO_API}/outstanding_client_balances.json"
     params = {"fields": "contact{id,name},total_outstanding_balance"}
     return paginate(url, params)
 
 def fetch_billable_matters():
-    """
-    Unbilled amounts/hours per *matter*.
-    """
     url = f"{CLIO_API}/billable_matters.json"
-    fields = "id,display_number,client{id,name},unbilled_amount,unbilled_hours"
-    params = {"fields": fields}
+    params = {"fields": "id,display_number,client{id,name},unbilled_amount,unbilled_hours"}
     return paginate(url, params)
 
+def fetch_cycle_hours(start_iso: str, end_iso: str):
+    """
+    Sum rounded hours per matter display_number within the cycle window.
+    Returns { display_number: total_hours }
+    """
+    url = f"{CLIO_API}/activities"
+    fields = "id,rounded_quantity,type,matter{id,display_number}"
+    params = {
+        "start_date": start_iso,
+        "end_date": end_iso,
+        "status": "billable",
+        "fields": fields,
+        "order": "id(asc)",
+        "limit": PAGE_LIMIT
+    }
+    totals = {}
+    entries = paginate(url, params)
+    for e in entries:
+        if e.get("type") != "TimeEntry":
+            continue
+        m = e.get("matter") or {}
+        dn = m.get("display_number")
+        if not dn:
+            continue
+        rq = e.get("rounded_quantity") or 0
+        try:
+            hours = float(rq) / 3600.0
+        except Exception:
+            hours = 0.0
+        totals[dn] = totals.get(dn, 0.0) + hours
+    return totals
+
 # ==============================
-# SharePoint (unchanged)
+# SharePoint upload
 # ==============================
 def ensure_folder(path: str, headers: dict):
     segments = path.strip("/").split("/")
@@ -282,13 +307,11 @@ def upload_file(file_path: str, file_name: str, folder_path: str):
     tok = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
     if "access_token" not in tok:
         raise Exception(f"Failed to get Graph token: {tok.get('error_description')}")
-
     headers = {"Authorization": f"Bearer {tok['access_token']}", "Content-Type": "application/json"}
     ensure_folder(folder_path, headers)
-
+    from urllib.parse import quote
     encoded_path = quote(f"{folder_path}/{file_name}")
     upload_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{encoded_path}:/content"
-
     with open(file_path, "rb") as f:
         res = requests.put(upload_url, headers={"Authorization": f"Bearer {tok['access_token']}"}, data=f)
     if res.status_code not in (200, 201):
@@ -296,46 +319,75 @@ def upload_file(file_path: str, file_name: str, folder_path: str):
     print(f"✅ Uploaded {file_name} to SharePoint at {folder_path}/")
 
 # ==============================
-# Report generation
+# Report builder
 # ==============================
+def _resolve_cf_value(cf: dict, meta_by_name: dict) -> str:
+    """
+    Prefer picklist option text. If only numeric value is present for picklist,
+    translate via meta mapping. Otherwise use raw 'value'.
+    """
+    fname = cf.get("field_name")
+    ftype = cf.get("field_type")
+    if ftype == "picklist":
+        # Try nested option first
+        opt = (cf.get("picklist_option") or {}).get("option")
+        if opt:
+            return opt
+        # Fallback: map the numeric/string ID to text using meta
+        raw = cf.get("value")
+        options = ((meta_by_name.get(fname) or {}).get("options")) or {}
+        if raw is not None and str(raw) in options:
+            return options[str(raw)] or ""
+        return str(raw or "")
+    # non-picklist
+    return str(cf.get("value") or "")
+
 def build_report_dataframe() -> pd.DataFrame:
-    """
-    Collect data from Clio and return a DataFrame with OUTPUT_FIELDS
-    and computed Net Trust Account Balance, sorted descending.
-    """
-    # Base matters (includes balances + custom fields)
+    # Meta for picklist translations
+    cf_meta = fetch_custom_fields_meta()
+
+    # Base pulls
     matters = fetch_open_matters_with_cf()
-    # Outstanding balances per client
     ocb = fetch_outstanding_client_balances()
-    # Unbilled per matter
     billable = fetch_billable_matters()
 
-    # --- Build frames
-    # matters base
+    start_iso, end_iso = cycle_iso(CYCLE_START_DATE, CYCLE_END_DATE, TIMEZONE_OFFSET)
+    cycle_hours = fetch_cycle_hours(start_iso, end_iso)
+
+    # Build frames
     m_rows = []
     for m in matters:
-        acc_bal = 0.0
+        # trust balances
+        trust = 0.0
         for b in (m.get("account_balances") or []):
             try:
-                acc_bal += float((b or {}).get("balance", 0) or 0)
+                trust += float((b or {}).get("balance", 0) or 0)
             except Exception:
                 pass
+        # flatten custom fields into dict of {name: resolved_value}
+        cf_map = {}
+        for cf in (m.get("custom_field_values") or []):
+            if not isinstance(cf, dict):
+                continue
+            name = cf.get("field_name")
+            if not name:
+                continue
+            cf_map[name] = _resolve_cf_value(cf, cf_meta)
 
+        display_number = m.get("display_number") or m.get("number") or ""
         m_rows.append({
             "Matter ID": m.get("id"),
-            "Matter Number": m.get("display_number") or m.get("number") or "",
+            "Matter Number": display_number,
             "Client ID": (m.get("client") or {}).get("id"),
             "Client Name": (m.get("client") or {}).get("name") or "",
             "Matter Stage": (m.get("matter_stage") or {}).get("name") or "",
             "Responsible Attorney": (m.get("responsible_attorney") or {}).get("name") or "",
-            "Trust Account Balance": acc_bal,
-            # stash raw custom fields to extract named ones below
-            "_custom_field_values": m.get("custom_field_values") or []
+            "Trust Account Balance": trust,
+            "_cf_map": cf_map
         })
-
     matter_df = pd.DataFrame(m_rows)
 
-    # outstanding by client
+    # Outstanding per client
     ocb_rows = []
     for r in ocb:
         ocb_rows.append({
@@ -344,7 +396,7 @@ def build_report_dataframe() -> pd.DataFrame:
         })
     ocb_df = pd.DataFrame(ocb_rows)
 
-    # unbilled per matter
+    # Unbilled per matter
     b_rows = []
     for bm in billable:
         b_rows.append({
@@ -356,63 +408,51 @@ def build_report_dataframe() -> pd.DataFrame:
         })
     billable_df = pd.DataFrame(b_rows)
 
-    # Ensure base columns exist even if empty results to avoid KeyError
+    # Defensive columns
     for df, cols in [
-        (matter_df, ["Matter ID","Matter Number","Client ID","Client Name","Matter Stage","Responsible Attorney","Trust Account Balance","_custom_field_values"]),
+        (matter_df, ["Matter ID","Matter Number","Client ID","Client Name","Matter Stage","Responsible Attorney","Trust Account Balance","_cf_map"]),
         (ocb_df, ["Client ID","Outstanding Balance"]),
-        (billable_df, ["Matter ID","Matter Number","Client ID","Unbilled Amount","Unbilled Hours"]),
+        (billable_df, ["Matter ID","Unbilled Amount","Unbilled Hours"]),
     ]:
         for c in cols:
             if c not in df.columns:
-                df[c] = 0 if "Amount" in c or c.endswith("Balance") else ""
+                df[c] = 0 if ("Amount" in c or c.endswith("Balance")) else ({} if c == "_cf_map" else "")
 
-    # --- Merge (base = matters; include ALL open/pending matters)
+    # Merge (base = matters)
     combined = (
         matter_df
         .merge(ocb_df, on="Client ID", how="left")
         .merge(billable_df[["Matter ID","Unbilled Amount","Unbilled Hours"]], on="Matter ID", how="left")
     )
 
-    # Fill missing numeric fields
+    # Fill NaNs numerics
     for c in ["Trust Account Balance","Outstanding Balance","Unbilled Amount","Unbilled Hours"]:
         if c in combined.columns:
             combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
 
-    # --- Compute Net Trust Account Balance (same as Traffic Light report)
+    # Net Trust Account Balance (same formula as traffic light)
     combined["Net Trust Account Balance"] = (
         combined["Trust Account Balance"] - combined["Outstanding Balance"] - combined["Unbilled Amount"]
     ).astype(float)
 
-    # --- Extract custom fields into named columns (picklist -> option text)
-    def extract_cf_map(cf_list):
-        out = {}
-        for cf in (cf_list or []):
-            if not isinstance(cf, dict):
-                continue
-            fname = cf.get("field_name")
-            if not fname:
-                continue
-            val = cf.get("value")
-            if (not val) and isinstance(cf.get("picklist_option"), dict):
-                val = cf["picklist_option"].get("option", "")
-            out[fname] = val or ""
-        return out
+    # Billing Cycle Hours from activities map (by display number)
+    combined[BILLING_COL] = combined["Matter Number"].map(lambda dn: float(cycle_hours.get(dn, 0.0)))
 
-    combined["_cf_map"] = combined["_custom_field_values"].apply(extract_cf_map)
-
-    # --- Build output rows in the exact OUTPUT_FIELDS order
+    # Build output rows in the exact OUTPUT_FIELDS order
     rows = []
     for _, r in combined.iterrows():
-        cf = r["_cf_map"]
-
+        cf = r.get("_cf_map", {}) or {}
         row = {
             "Matter Number": r.get("Matter Number", ""),
             "Client Name": r.get("Client Name", ""),
             "CR ID": cf.get("CR ID", ""),
             "Net Trust Account Balance": float(r.get("Net Trust Account Balance", 0.0)),
             "Matter Stage": r.get("Matter Stage", ""),
+            BILLING_COL: float(r.get(BILLING_COL, 0.0)),
             "Responsible Attorney": r.get("Responsible Attorney", ""),
-            "Main Paralegal": cf.get("Main Paralegal", ""),                 # picklist option text
+            "Main Paralegal": cf.get("Main Paralegal", ""),          # picklist option text
+            "Supporting Attorney": cf.get("Supporting Attorney", ""),# picklist option text
+            "Supporting Paralegal": cf.get("Supporting Paralegal", ""), # picklist option text
             "Client Notes": cf.get("Client Notes", ""),
             "Initial Client Goals": cf.get("Initial Client Goals", ""),
             "Initial Strategy": cf.get("Initial Strategy", ""),
@@ -434,18 +474,14 @@ def build_report_dataframe() -> pd.DataFrame:
 
     df = pd.DataFrame(rows, columns=OUTPUT_FIELDS)
 
-    # --- Sort by Net Trust Account Balance (desc)
+    # Sort by Net Trust Account Balance (desc)
     df = df.sort_values(by="Net Trust Account Balance", ascending=False, kind="mergesort").reset_index(drop=True)
     return df
 
+# ==============================
+# Excel writer (traffic-light formatting)
+# ==============================
 def write_excel(df: pd.DataFrame, file_path: str):
-    """
-    Writes the DataFrame to Excel with:
-    - currency formatting for Net Trust
-    - traffic-light conditional fills (same thresholds)
-    - table styling
-    """
-    # Write with openpyxl to control formatting
     wb = Workbook()
     ws = wb.active
     ws.title = "Case Review"
@@ -457,7 +493,6 @@ def write_excel(df: pd.DataFrame, file_path: str):
     for _, row in df.iterrows():
         ws.append([row.get(col, "") for col in df.columns])
 
-    # Locate Net Trust column index
     headers = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
     net_col = headers.get("Net Trust Account Balance", None)
 
@@ -467,13 +502,11 @@ def write_excel(df: pd.DataFrame, file_path: str):
     green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     bold_font = Font(bold=True)
 
-    # Format data rows
+    # Currency / fills
     for r in range(2, ws.max_row + 1):
         if net_col:
             c = ws.cell(row=r, column=net_col)
-            # currency number format
             c.number_format = "$#,##0.00"
-            # traffic light fill
             try:
                 val = float(c.value or 0)
                 if val <= 0:
@@ -498,37 +531,29 @@ def write_excel(df: pd.DataFrame, file_path: str):
     table.tableStyleInfo = style
     ws.add_table(table)
 
-    # Save file
     wb.save(file_path)
     print(f"✅ Saved Excel: {file_path}")
 
+# ==============================
+# Entrypoint: build + upload
+# ==============================
 def extract_custom_data_and_build_file() -> str:
     df = build_report_dataframe()
-
-    # Save to a temp file (Render)
     tmp_dir = "/tmp"
     os.makedirs(tmp_dir, exist_ok=True)
     file_path = os.path.join(tmp_dir, "case_review.xlsx")
-
     write_excel(df, file_path)
     return file_path
 
 def main():
-    # Build report and upload
     file_path = extract_custom_data_and_build_file()
     file_date = datetime.now().strftime("%y%m%d")
     file_name = f"{file_date}.Seabrook's Case Review List.xlsx"
     upload_file(file_path, file_name, SHAREPOINT_DOC_LIB)
-
-    # Cleanup temp
     try:
         os.remove(file_path)
     except Exception:
         pass
 
 if __name__ == "__main__":
-    main()
-
-
-if __name__ == '__main__':
     main()
