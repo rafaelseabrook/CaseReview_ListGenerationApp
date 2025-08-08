@@ -1,27 +1,45 @@
+# -*- coding: utf-8 -*-
+"""
+Case Review Report (fixed)
+- Correct Net Trust Account Balance (Trust - Outstanding - Unbilled)
+- Includes ALL open/pending matters
+- Stable joins by IDs; custom field *names* (picklist text) included
+- Rate-limit aware requests, 401 refresh, and proper pagination
+- Same color formatting & ordering as Traffic Light report
+"""
+
 import os
-import time
 import re
+import time
+import shutil
 import requests
 import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
 import msal
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill, Font
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 # ==============================
 # Environment / Config
 # ==============================
 API_VERSION = "4"
-CLIO_BASE = os.getenv("CLIO_BASE", "https://app.clio.com")
+CLIO_BASE = os.getenv("CLIO_BASE", "https://app.clio.com").rstrip("/")
 CLIO_API = f"{CLIO_BASE}/api/v{API_VERSION}"
 CLIO_TOKEN_URL = f"{CLIO_BASE}/oauth/token"
 
-# Clio OAuth (env should be pre-seeded on Render)
+# Clio OAuth (env-backed; uses refresh token)
 CLIO_CLIENT_ID = os.getenv("CLIO_CLIENT_ID")
 CLIO_CLIENT_SECRET = os.getenv("CLIO_CLIENT_SECRET")
-CLIO_REFRESH_TOKEN = os.getenv("CLIO_REFRESH_TOKEN")
-CLIO_ACCESS_TOKEN = os.getenv("CLIO_ACCESS_TOKEN")
-CLIO_EXPIRES_IN = float(os.getenv("CLIO_EXPIRES_IN", "0"))  # epoch seconds
+CLIO_REFRESH_TOKEN = os.getenv("CLIO_REFRESH_TOKEN")  # persisted in env
+CLIO_ACCESS_TOKEN = os.getenv("CLIO_ACCESS_TOKEN")     # ephemeral
+# Backward compat: read old EXPIRES_IN if present; prefer EXPIRES_AT
+_CLIO_EXPIRES_AT_ENV = os.getenv("CLIO_EXPIRES_AT") or os.getenv("CLIO_EXPIRES_IN")
+try:
+    CLIO_EXPIRES_AT = float(_CLIO_EXPIRES_AT_ENV) if _CLIO_EXPIRES_AT_ENV else 0.0
+except Exception:
+    CLIO_EXPIRES_AT = 0.0
 CLIO_REDIRECT_URI = os.getenv("CLIO_REDIRECT_URI")
 
 # SharePoint / Graph
@@ -30,9 +48,12 @@ SHAREPOINT_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
 SHAREPOINT_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
 SHAREPOINT_SITE_ID = os.getenv("SHAREPOINT_SITE_ID")
 SHAREPOINT_DRIVE_ID = os.getenv("SHAREPOINT_DRIVE_ID")
-SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB", "General Management/Global Case Review Lists")
+SHAREPOINT_DOC_LIB = os.getenv(
+    "SHAREPOINT_DOC_LIB",
+    "General Management/Global Case Review Lists"
+)
 
-# Report columns (unchanged for this report)
+# Report columns (kept as you provided)
 OUTPUT_FIELDS = [
     "Matter Number","Client Name","CR ID","Net Trust Account Balance","Matter Stage",
     "Responsible Attorney","Main Paralegal","Client Notes","Initial Client Goals","Initial Strategy",
@@ -41,9 +62,9 @@ OUTPUT_FIELDS = [
     "Judgment Trial","Post Judgment","collection efforts"
 ]
 
-# Rate limiting controls
-PAGE_LIMIT = 50                 # Clio hard max
-GLOBAL_MIN_SLEEP = float(os.getenv("CLIO_GLOBAL_MIN_SLEEP_SEC", "1.25"))
+# Rate limiting / pagination
+PAGE_LIMIT = 200
+GLOBAL_MIN_SLEEP = float(os.getenv("CLIO_GLOBAL_MIN_SLEEP_SEC", "0.25"))
 
 session = requests.Session()
 session.headers.update({"Accept": "application/json"})
@@ -51,19 +72,28 @@ session.headers.update({"Accept": "application/json"})
 # ==============================
 # Auth Helpers (env-backed)
 # ==============================
-def save_tokens_env(tokens: dict):
-    os.environ["CLIO_ACCESS_TOKEN"] = tokens["access_token"]
-    os.environ["CLIO_EXPIRES_IN"] = str(datetime.now().timestamp() + tokens["expires_in"])
+def _save_tokens_env(tokens: dict):
+    """
+    Persist ephemeral tokens in environment for the running process.
+    Preserve refresh_token if not returned.
+    """
+    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_AT, CLIO_REFRESH_TOKEN
+    CLIO_ACCESS_TOKEN = tokens.get("access_token", CLIO_ACCESS_TOKEN)
+    # Clio commonly does not return refresh_token on refresh; preserve prior
+    if tokens.get("refresh_token"):
+        CLIO_REFRESH_TOKEN = tokens["refresh_token"]
+        os.environ["CLIO_REFRESH_TOKEN"] = CLIO_REFRESH_TOKEN
+    # Convert expires_in -> expires_at
+    expires_in = tokens.get("expires_in", 0)
+    try:
+        CLIO_EXPIRES_AT = time.time() + float(expires_in)
+    except Exception:
+        CLIO_EXPIRES_AT = time.time() + 3000
+    os.environ["CLIO_ACCESS_TOKEN"] = CLIO_ACCESS_TOKEN or ""
+    os.environ["CLIO_EXPIRES_AT"] = str(CLIO_EXPIRES_AT)
 
-def get_clio_token() -> str:
-    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_IN
-    now = datetime.now().timestamp()
-    if not CLIO_ACCESS_TOKEN or now >= CLIO_EXPIRES_IN:
-        return refresh_clio_token()
-    return CLIO_ACCESS_TOKEN
-
-def refresh_clio_token() -> str:
-    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_IN
+def _refresh_clio_token() -> str:
+    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_AT, CLIO_REFRESH_TOKEN
     if not (CLIO_CLIENT_ID and CLIO_CLIENT_SECRET and CLIO_REFRESH_TOKEN):
         raise RuntimeError("Missing CLIO_CLIENT_ID/CLIO_CLIENT_SECRET/CLIO_REFRESH_TOKEN.")
     resp = session.post(CLIO_TOKEN_URL, data={
@@ -71,44 +101,48 @@ def refresh_clio_token() -> str:
         "refresh_token": CLIO_REFRESH_TOKEN,
         "client_id": CLIO_CLIENT_ID,
         "client_secret": CLIO_CLIENT_SECRET
-    }, timeout=45)
-    resp.raise_for_status()
-    tok = resp.json()
-    CLIO_ACCESS_TOKEN = tok["access_token"]
-    CLIO_EXPIRES_IN = datetime.now().timestamp() + tok["expires_in"]
-    save_tokens_env(tok)
+    }, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Token refresh failed: {resp.status_code} {resp.text[:200]}")
+    tokens = resp.json() or {}
+    _save_tokens_env(tokens)
     return CLIO_ACCESS_TOKEN
 
-def ensure_auth_header():
-    token = get_clio_token()
+def _get_clio_token() -> str:
+    global CLIO_ACCESS_TOKEN, CLIO_EXPIRES_AT
+    now = time.time()
+    if not CLIO_ACCESS_TOKEN or now >= (CLIO_EXPIRES_AT or 0):
+        return _refresh_clio_token()
+    return CLIO_ACCESS_TOKEN
+
+def _ensure_auth_header():
+    token = _get_clio_token()
     session.headers["Authorization"] = f"Bearer {token}"
 
 # ==============================
 # Backoff / Request Wrapper
 # ==============================
-def _sleep_with_floor(start_ts: float, retry_after: int | None = None):
+def _sleep_with_floor(start_ts: float, retry_after: int | float | None = None):
     elapsed = time.time() - start_ts
     base_wait = max(0, GLOBAL_MIN_SLEEP - elapsed)
-    wait = max(base_wait, retry_after or 0)
+    wait = max(base_wait, float(retry_after or 0))
     if wait > 0:
         time.sleep(wait)
 
 def _request(method: str, url: str, **kwargs) -> requests.Response:
-    ensure_auth_header()
+    _ensure_auth_header()
     max_tries = kwargs.pop("max_tries", 7)
     backoff = 1
     for _ in range(max_tries):
         t0 = time.time()
-        resp = session.request(method, url, timeout=45, **kwargs)
+        resp = session.request(method, url, timeout=60, **kwargs)
 
-        # Token expiry / auth issues -> refresh once
+        # Token expiry / auth issues -> refresh once per attempt
         if resp.status_code == 401:
             try:
-                refresh_clio_token()
-            except Exception as e:
-                _sleep_with_floor(t0)
-                raise
-            _sleep_with_floor(t0)
+                _refresh_clio_token()
+            finally:
+                _sleep_with_floor(t0, retry_after=1)
             continue
 
         # Rate limit
@@ -137,77 +171,86 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
 
         _sleep_with_floor(t0)
         return resp
-    return resp
+    return resp  # last response (likely error)
 
 # ==============================
-# Generic Clio fetch (limit=50 + page_token)
+# Proper Clio pagination (meta.paging.next)
 # ==============================
-def fetch_data(url: str, params: dict):
+def paginate(url: str, params: dict | None = None):
     params = dict(params or {})
-    params["limit"] = PAGE_LIMIT
+    params.setdefault("limit", PAGE_LIMIT)
+    params.setdefault("order", "id(asc)")  # stable cursor pagination
+
+    next_url = url
+    next_params = params
     all_rows = []
-    seen_tokens = set()
-    page_token = None
 
     while True:
-        if page_token:
-            params["page_token"] = page_token
-        resp = _request("GET", url, params=params)
-        print(f"GET {url} params={params} → {resp.status_code}")
+        resp = _request("GET", next_url, params=next_params)
+        print(f"GET {next_url} params={next_params} → {resp.status_code}")
         if resp.status_code != 200:
             print(f"Failed: {resp.status_code} {resp.text[:200]}")
             break
 
         body = resp.json() or {}
         rows = body.get("data", [])
-        meta = body.get("meta", {}) if isinstance(body, dict) else {}
-        next_token = meta.get("next_page_token") or meta.get("next_token")
+        if isinstance(rows, list):
+            all_rows.extend([r for r in rows if isinstance(r, dict)])
 
-        all_rows.extend([r for r in rows if isinstance(r, dict)])
+        paging = (body.get("meta") or {}).get("paging") or {}
+        next_link = paging.get("next")
 
-        if next_token and next_token not in seen_tokens:
-            seen_tokens.add(next_token)
-            page_token = next_token
+        if next_link:
+            next_url = next_link
+            next_params = None
             continue
 
-        # stop on short page or no token
-        if len(rows) < PAGE_LIMIT or not next_token:
+        # Fallback: stop when short page and no 'next'
+        if len(rows) < params["limit"]:
             break
+        else:
+            break  # avoid accidental infinite loop
 
     return all_rows
 
 # ==============================
-# Clio data (custom fields + matters)
+# Clio data fetchers
 # ==============================
-def fetch_custom_fields():
-    url = f"{CLIO_API}/custom_fields.json"
-    params = {"fields": "id,name,field_type,picklist_options"}
-    rows = fetch_data(url, params)
-    # Return a name->id map (handle both 'name' and legacy 'field_name')
-    out = {}
-    for f in rows:
-        key = f.get("name") or f.get("field_name")
-        if key and "id" in f:
-            out[key] = f["id"]
-    return out
-
-def fetch_open_matters():
+def fetch_open_matters_with_cf():
+    """
+    Matters with account balances and required headers + custom fields.
+    """
     url = f"{CLIO_API}/matters.json"
-    # include client id+name in case you ever need ID-joins later
-    params = {
-        "status": "open,pending",
-        "fields": (
-            "id,number,display_number,"
-            "client{id,name},"
-            "matter_stage{name},"
-            "responsible_attorney{name},"
-            "custom_field_values{id,field_name,field_type,value,picklist_option}"
-        )
-    }
-    return fetch_data(url, params)
+    fields = (
+        "id,display_number,number,"
+        "client{id,name},"
+        "matter_stage{name},"
+        "responsible_attorney{name},"
+        "account_balances{balance},"
+        "custom_field_values{id,field_name,field_type,value,picklist_option}"
+    )
+    params = {"status": "open,pending", "fields": fields}
+    return paginate(url, params)
+
+def fetch_outstanding_client_balances():
+    """
+    Outstanding AR per client (contact).
+    """
+    url = f"{CLIO_API}/outstanding_client_balances.json"
+    params = {"fields": "contact{id,name},total_outstanding_balance"}
+    return paginate(url, params)
+
+def fetch_billable_matters():
+    """
+    Unbilled amounts/hours per *matter*.
+    """
+    url = f"{CLIO_API}/billable_matters.json"
+    fields = "id,display_number,client{id,name},unbilled_amount,unbilled_hours"
+    params = {"fields": fields}
+    return paginate(url, params)
 
 # ==============================
-# SharePoint upload (Graph)
+# SharePoint (unchanged)
 # ==============================
 def ensure_folder(path: str, headers: dict):
     segments = path.strip("/").split("/")
@@ -255,62 +298,235 @@ def upload_file(file_path: str, file_name: str, folder_path: str):
 # ==============================
 # Report generation
 # ==============================
-def extract_custom_data():
-    # We don’t actually need the field-id map to build the rows,
-    # but keeping the call here as a health check/log if you want.
-    _ = fetch_custom_fields()
-    matters = fetch_open_matters()
+def build_report_dataframe() -> pd.DataFrame:
+    """
+    Collect data from Clio and return a DataFrame with OUTPUT_FIELDS
+    and computed Net Trust Account Balance, sorted descending.
+    """
+    # Base matters (includes balances + custom fields)
+    matters = fetch_open_matters_with_cf()
+    # Outstanding balances per client
+    ocb = fetch_outstanding_client_balances()
+    # Unbilled per matter
+    billable = fetch_billable_matters()
 
-    file_path = "/tmp/case_review.xlsx"
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Case Review"
-    ws.append(OUTPUT_FIELDS)
-
+    # --- Build frames
+    # matters base
+    m_rows = []
     for m in matters:
-        # Custom fields -> simple name:value map
-        custom_map = {}
-        for cf in (m.get("custom_field_values") or []):
+        acc_bal = 0.0
+        for b in (m.get("account_balances") or []):
+            try:
+                acc_bal += float((b or {}).get("balance", 0) or 0)
+            except Exception:
+                pass
+
+        m_rows.append({
+            "Matter ID": m.get("id"),
+            "Matter Number": m.get("display_number") or m.get("number") or "",
+            "Client ID": (m.get("client") or {}).get("id"),
+            "Client Name": (m.get("client") or {}).get("name") or "",
+            "Matter Stage": (m.get("matter_stage") or {}).get("name") or "",
+            "Responsible Attorney": (m.get("responsible_attorney") or {}).get("name") or "",
+            "Trust Account Balance": acc_bal,
+            # stash raw custom fields to extract named ones below
+            "_custom_field_values": m.get("custom_field_values") or []
+        })
+
+    matter_df = pd.DataFrame(m_rows)
+
+    # outstanding by client
+    ocb_rows = []
+    for r in ocb:
+        ocb_rows.append({
+            "Client ID": (r.get("contact") or {}).get("id"),
+            "Outstanding Balance": r.get("total_outstanding_balance", 0) or 0
+        })
+    ocb_df = pd.DataFrame(ocb_rows)
+
+    # unbilled per matter
+    b_rows = []
+    for bm in billable:
+        b_rows.append({
+            "Matter ID": bm.get("id"),
+            "Matter Number": bm.get("display_number") or "",
+            "Client ID": (bm.get("client") or {}).get("id"),
+            "Unbilled Amount": bm.get("unbilled_amount", 0) or 0,
+            "Unbilled Hours": bm.get("unbilled_hours", 0) or 0
+        })
+    billable_df = pd.DataFrame(b_rows)
+
+    # Ensure base columns exist even if empty results to avoid KeyError
+    for df, cols in [
+        (matter_df, ["Matter ID","Matter Number","Client ID","Client Name","Matter Stage","Responsible Attorney","Trust Account Balance","_custom_field_values"]),
+        (ocb_df, ["Client ID","Outstanding Balance"]),
+        (billable_df, ["Matter ID","Matter Number","Client ID","Unbilled Amount","Unbilled Hours"]),
+    ]:
+        for c in cols:
+            if c not in df.columns:
+                df[c] = 0 if "Amount" in c or c.endswith("Balance") else ""
+
+    # --- Merge (base = matters; include ALL open/pending matters)
+    combined = (
+        matter_df
+        .merge(ocb_df, on="Client ID", how="left")
+        .merge(billable_df[["Matter ID","Unbilled Amount","Unbilled Hours"]], on="Matter ID", how="left")
+    )
+
+    # Fill missing numeric fields
+    for c in ["Trust Account Balance","Outstanding Balance","Unbilled Amount","Unbilled Hours"]:
+        if c in combined.columns:
+            combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
+
+    # --- Compute Net Trust Account Balance (same as Traffic Light report)
+    combined["Net Trust Account Balance"] = (
+        combined["Trust Account Balance"] - combined["Outstanding Balance"] - combined["Unbilled Amount"]
+    ).astype(float)
+
+    # --- Extract custom fields into named columns (picklist -> option text)
+    def extract_cf_map(cf_list):
+        out = {}
+        for cf in (cf_list or []):
             if not isinstance(cf, dict):
                 continue
             fname = cf.get("field_name")
-            # value or picklist option text
+            if not fname:
+                continue
             val = cf.get("value")
-            if not val and isinstance(cf.get("picklist_option"), dict):
+            if (not val) and isinstance(cf.get("picklist_option"), dict):
                 val = cf["picklist_option"].get("option", "")
-            custom_map[fname] = val or ""
+            out[fname] = val or ""
+        return out
+
+    combined["_cf_map"] = combined["_custom_field_values"].apply(extract_cf_map)
+
+    # --- Build output rows in the exact OUTPUT_FIELDS order
+    rows = []
+    for _, r in combined.iterrows():
+        cf = r["_cf_map"]
 
         row = {
-            "Matter Number": m.get("number") or m.get("display_number") or "",
-            "Client Name": (m.get("client") or {}).get("name", "") or "",
-            "Matter Stage": (m.get("matter_stage") or {}).get("name", "") or "",
-            "Responsible Attorney": (m.get("responsible_attorney") or {}).get("name", "") or "",
-            # Your report keeps Net Trust Account Balance as a fixed field here
-            "Net Trust Account Balance": 0
+            "Matter Number": r.get("Matter Number", ""),
+            "Client Name": r.get("Client Name", ""),
+            "CR ID": cf.get("CR ID", ""),
+            "Net Trust Account Balance": float(r.get("Net Trust Account Balance", 0.0)),
+            "Matter Stage": r.get("Matter Stage", ""),
+            "Responsible Attorney": r.get("Responsible Attorney", ""),
+            "Main Paralegal": cf.get("Main Paralegal", ""),                 # picklist option text
+            "Client Notes": cf.get("Client Notes", ""),
+            "Initial Client Goals": cf.get("Initial Client Goals", ""),
+            "Initial Strategy": cf.get("Initial Strategy", ""),
+            "Has strategy changed Describe": cf.get("Has strategy changed Describe", ""),
+            "Current action Items": cf.get("Current action Items", ""),
+            "Hearings": cf.get("Hearings", ""),
+            "Deadlines": cf.get("Deadlines", ""),
+            "DV situation description": cf.get("DV situation description", ""),
+            "Custody Visitation": cf.get("Custody Visitation", ""),
+            "CS Add ons Extracurricular": cf.get("CS Add ons Extracurricular", ""),
+            "Spousal Support": cf.get("Spousal Support", ""),
+            "PDDs": cf.get("PDDs", ""),
+            "Discovery": cf.get("Discovery", ""),
+            "Judgment Trial": cf.get("Judgment Trial", ""),
+            "Post Judgment": cf.get("Post Judgment", ""),
+            "collection efforts": cf.get("collection efforts", "")
         }
+        rows.append(row)
 
-        # Fill all remaining OUTPUT_FIELDS from custom_map, default ''
-        for key in OUTPUT_FIELDS:
-            if key not in row:
-                row[key] = custom_map.get(key, '')
+    df = pd.DataFrame(rows, columns=OUTPUT_FIELDS)
 
-        # Append in the exact OUTPUT_FIELDS order
-        ws.append([row.get(k, '') for k in OUTPUT_FIELDS])
+    # --- Sort by Net Trust Account Balance (desc)
+    df = df.sort_values(by="Net Trust Account Balance", ascending=False, kind="mergesort").reset_index(drop=True)
+    return df
 
+def write_excel(df: pd.DataFrame, file_path: str):
+    """
+    Writes the DataFrame to Excel with:
+    - currency formatting for Net Trust
+    - traffic-light conditional fills (same thresholds)
+    - table styling
+    """
+    # Write with openpyxl to control formatting
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Case Review"
+
+    # Headers
+    ws.append(list(df.columns))
+
+    # Rows
+    for _, row in df.iterrows():
+        ws.append([row.get(col, "") for col in df.columns])
+
+    # Locate Net Trust column index
+    headers = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
+    net_col = headers.get("Net Trust Account Balance", None)
+
+    # Styles (same as Traffic Light)
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    bold_font = Font(bold=True)
+
+    # Format data rows
+    for r in range(2, ws.max_row + 1):
+        if net_col:
+            c = ws.cell(row=r, column=net_col)
+            # currency number format
+            c.number_format = "$#,##0.00"
+            # traffic light fill
+            try:
+                val = float(c.value or 0)
+                if val <= 0:
+                    c.fill = red_fill
+                elif 0 < val < 1000:
+                    c.fill = yellow_fill
+                else:
+                    c.fill = green_fill
+            except Exception:
+                pass
+
+    # Add table styling
+    ref = f"A1:{ws.cell(row=ws.max_row, column=ws.max_column).coordinate}"
+    table = Table(displayName="CaseReviewTable", ref=ref)
+    style = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False
+    )
+    table.tableStyleInfo = style
+    ws.add_table(table)
+
+    # Save file
     wb.save(file_path)
+    print(f"✅ Saved Excel: {file_path}")
+
+def extract_custom_data_and_build_file() -> str:
+    df = build_report_dataframe()
+
+    # Save to a temp file (Render)
+    tmp_dir = "/tmp"
+    os.makedirs(tmp_dir, exist_ok=True)
+    file_path = os.path.join(tmp_dir, "case_review.xlsx")
+
+    write_excel(df, file_path)
     return file_path
 
 def main():
-    file_path = extract_custom_data()
+    # Build report and upload
+    file_path = extract_custom_data_and_build_file()
     file_date = datetime.now().strftime("%y%m%d")
     file_name = f"{file_date}.Seabrook's Case Review List.xlsx"
     upload_file(file_path, file_name, SHAREPOINT_DOC_LIB)
+
+    # Cleanup temp
     try:
         os.remove(file_path)
     except Exception:
         pass
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
 
