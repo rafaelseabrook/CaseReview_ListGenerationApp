@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Case Review Report (fixed) + Splitter
-- Correct picklist names (no more numeric IDs for paralegals)
-- Adds Billing Cycle Hours (configurable date range) from Activities
-- Correct Net Trust Account Balance = Trust - Outstanding - Unbilled
-- Includes ALL open/pending matters
-- Same color formatting (traffic light) + sort by Net Trust desc
-- NEW: Splits master report into 4 Excel files by Responsible Attorney and uploads to each folder
+Case Review Report (fixed) + Splitter (TEST MODE)
+- Adds 'TEST ' prefix to all uploaded filenames
+- Matches Responsible Attorneys by last name (handles 'First Last' and 'Last, First')
+- Keeps traffic-light formatting and SharePoint uploads
 """
 
 import os
@@ -17,18 +14,18 @@ import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
 import msal
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 # ==============================
-# Config (edit these 4 for billing cycle)
+# Config (billing cycle)
 # ==============================
-CYCLE_START_LABEL = "07/02/25"   # shown in column header
-CYCLE_END_LABEL   = "07/15/25"   # shown in column header
-CYCLE_START_DATE  = "2025-07-02" # used in Activities query
-CYCLE_END_DATE    = "2025-07-15" # used in Activities query
-TIMEZONE_OFFSET   = os.getenv("CLIO_TZ_OFFSET", "-08:00")  # used to build ISO times
+CYCLE_START_LABEL = "07/02/25"
+CYCLE_END_LABEL   = "07/15/25"
+CYCLE_START_DATE  = "2025-07-02"
+CYCLE_END_DATE    = "2025-07-15"
+TIMEZONE_OFFSET   = os.getenv("CLIO_TZ_OFFSET", "-08:00")
 
 def cycle_iso(start_date: str, end_date: str, tz: str) -> tuple[str, str]:
     return f"{start_date}T00:00:00{tz}", f"{end_date}T23:59:59{tz}"
@@ -53,32 +50,36 @@ try:
 except Exception:
     _CLIO_EXPIRES_AT = 0.0
 
-# SharePoint / Graph
 SHAREPOINT_TENANT_ID = os.getenv("GRAPH_TENANT_ID")
 SHAREPOINT_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
 SHAREPOINT_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
 SHAREPOINT_SITE_ID = os.getenv("SHAREPOINT_SITE_ID")
 SHAREPOINT_DRIVE_ID = os.getenv("SHAREPOINT_DRIVE_ID")
-
-# Master upload folder (unchanged)
 SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB", "General Management/Global Case Review Lists")
 
 # ==============================
-# NEW: Attorney -> SharePoint folder map for split uploads
+# Attorney folder mapping (by last name)
 # ==============================
 ATTORNEY_FOLDERS = {
-    "Voorhees, Elizabeth": "Attorneys and Paralegals/Attorney Case Lists/Voorhees, Elizabeth",
-    "Darling, Craig":      "Attorneys and Paralegals/Attorney Case Lists/Darling, Craig",
-    "Huang, Lily":         "Attorneys and Paralegals/Attorney Case Lists/Huang, Lily",
-    "Parker, Gabriella":   "Attorneys and Paralegals/Attorney Case Lists/Parker, Gabriella",
+    "voorhees": "Attorneys and Paralegals/Attorney Case Lists/Voorhees, Elizabeth",
+    "darling":  "Attorneys and Paralegals/Attorney Case Lists/Darling, Craig",
+    "huang":    "Attorneys and Paralegals/Attorney Case Lists/Huang, Lily",
+    "parker":   "Attorneys and Paralegals/Attorney Case Lists/Parker, Gabriella",
+}
+
+ATTORNEY_DISPLAY = {
+    "voorhees": "Voorhees, Elizabeth",
+    "darling":  "Darling, Craig",
+    "huang":    "Huang, Lily",
+    "parker":   "Parker, Gabriella",
 }
 
 # ==============================
-# Output columns (exact order you requested)
+# Output columns
 # ==============================
 OUTPUT_FIELDS = [
     "Matter Number","Client Name","CR ID","Net Trust Account Balance","Matter Stage",
-    BILLING_COL,  # dynamic column
+    BILLING_COL,
     "Responsible Attorney","Main Paralegal","Supporting Attorney","Supporting Paralegal","Client Notes",
     "Initial Client Goals","Initial Strategy","Has strategy changed Describe","Current action Items",
     "Hearings","Deadlines","DV situation description","Custody Visitation","CS Add ons Extracurricular",
@@ -86,11 +87,10 @@ OUTPUT_FIELDS = [
 ]
 
 # ==============================
-# HTTP / Rate limiting
+# HTTP helpers
 # ==============================
 PAGE_LIMIT = 200
 GLOBAL_MIN_SLEEP = float(os.getenv("CLIO_GLOBAL_MIN_SLEEP_SEC", "0.25"))
-
 session = requests.Session()
 session.headers.update({"Accept": "application/json"})
 
@@ -110,7 +110,7 @@ def _save_tokens_env(tokens: dict):
 
 def _refresh_clio_token() -> str:
     if not (CLIO_CLIENT_ID and CLIO_CLIENT_SECRET and CLIO_REFRESH_TOKEN):
-        raise RuntimeError("Missing CLIO_CLIENT_ID/CLIO_CLIENT_SECRET/CLIO_REFRESH_TOKEN.")
+        raise RuntimeError("Missing CLIO credentials.")
     resp = session.post(CLIO_TOKEN_URL, data={
         "grant_type": "refresh_token",
         "refresh_token": CLIO_REFRESH_TOKEN,
@@ -124,7 +124,6 @@ def _refresh_clio_token() -> str:
     return _CLIO_ACCESS_TOKEN
 
 def _get_clio_token() -> str:
-    global _CLIO_ACCESS_TOKEN, _CLIO_EXPIRES_AT
     now = time.time()
     if (not _CLIO_ACCESS_TOKEN) or now >= (_CLIO_EXPIRES_AT or 0):
         return _refresh_clio_token()
@@ -149,31 +148,19 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
         t0 = time.time()
         resp = session.request(method, url, timeout=60, **kwargs)
         if resp.status_code == 401:
-            try:
-                _refresh_clio_token()
-            finally:
-                _sleep_with_floor(t0, retry_after=1)
+            _refresh_clio_token()
+            _sleep_with_floor(t0, retry_after=1)
             continue
         if resp.status_code == 429:
             ra = 30
             if resp.headers.get("Retry-After"):
-                try:
-                    ra = int(resp.headers["Retry-After"])
-                except ValueError:
-                    ra = 30
-            else:
-                try:
-                    msg = (resp.json() or {}).get("error", {}).get("message", "")
-                    m = re.search(r"Retry in (\d+)", msg)
-                    if m:
-                        ra = int(m.group(1))
-                except Exception:
-                    pass
-            print(f"[429] Rate limited. Waiting {ra}s …")
+                try: ra = int(resp.headers["Retry-After"])
+                except: ra = 30
+            print(f"[429] Waiting {ra}s…")
             _sleep_with_floor(t0, retry_after=ra)
             continue
         if 500 <= resp.status_code < 600:
-            print(f"[{resp.status_code}] Server error. Retrying in {backoff}s …")
+            print(f"[{resp.status_code}] Server error. Retrying in {backoff}s…")
             _sleep_with_floor(t0, retry_after=backoff)
             backoff = min(backoff * 2, 60)
             continue
@@ -185,8 +172,7 @@ def paginate(url: str, params: dict | None = None):
     params = dict(params or {})
     params.setdefault("limit", PAGE_LIMIT)
     params.setdefault("order", "id(asc)")
-    next_url = url
-    next_params = params
+    next_url, next_params = url, params
     all_rows = []
     while True:
         resp = _request("GET", next_url, params=next_params)
@@ -199,200 +185,138 @@ def paginate(url: str, params: dict | None = None):
         if isinstance(rows, list):
             all_rows.extend([r for r in rows if isinstance(r, dict)])
         paging = (body.get("meta") or {}).get("paging") or {}
-        next_link = paging.get("next")
-        if next_link:
-            next_url = next_link
-            next_params = None
+        if paging.get("next"):
+            next_url, next_params = paging["next"], None
             continue
-        if len(rows) < params["limit"]:
-            break
-        else:
-            break
+        break
     return all_rows
 
 # ==============================
 # Clio fetchers
 # ==============================
 def fetch_custom_fields_meta():
-    """
-    Returns:
-      { field_name: { 'id': int, 'type': str, 'options': {str(option_id): option_text } } }
-    """
-    url = f"{CLIO_API}/custom_fields.json"
-    params = {"fields": "id,name,field_type,picklist_options"}
-    rows = paginate(url, params)
+    rows = paginate(f"{CLIO_API}/custom_fields.json", {"fields": "id,name,field_type,picklist_options"})
     out = {}
     for f in rows:
         name = f.get("name")
         if not name:
             continue
-        opts = {}
-        for opt in (f.get("picklist_options") or []):
-            oid = opt.get("id")
-            text = opt.get("option")
-            if oid is not None:
-                opts[str(oid)] = text
+        opts = {str(o["id"]): o["option"] for o in f.get("picklist_options", []) if o.get("id")}
         out[name] = {"id": f.get("id"), "type": f.get("field_type"), "options": opts}
     return out
 
 def fetch_open_matters_with_cf():
-    url = f"{CLIO_API}/matters.json"
-    fields = (
-        "id,display_number,number,"
-        "client{id,name},"
-        "matter_stage{name},"
-        "responsible_attorney{name},"
-        "account_balances{balance},"
-        "custom_field_values{id,field_name,field_type,value,picklist_option}"
-    )
-    params = {"status": "open,pending", "fields": fields}
-    return paginate(url, params)
+    fields = ("id,display_number,number,client{id,name},matter_stage{name},"
+              "responsible_attorney{name},account_balances{balance},"
+              "custom_field_values{id,field_name,field_type,value,picklist_option}")
+    return paginate(f"{CLIO_API}/matters.json", {"status": "open,pending", "fields": fields})
 
 def fetch_outstanding_client_balances():
-    url = f"{CLIO_API}/outstanding_client_balances.json"
-    params = {"fields": "contact{id,name},total_outstanding_balance"}
-    return paginate(url, params)
+    return paginate(f"{CLIO_API}/outstanding_client_balances.json",
+                    {"fields": "contact{id,name},total_outstanding_balance"})
 
 def fetch_billable_matters():
-    url = f"{CLIO_API}/billable_matters.json"
-    params = {"fields": "id,display_number,client{id,name},unbilled_amount,unbilled_hours"}
-    return paginate(url, params)
+    return paginate(f"{CLIO_API}/billable_matters.json",
+                    {"fields": "id,display_number,client{id,name},unbilled_amount,unbilled_hours"})
 
 def fetch_cycle_hours(start_iso: str, end_iso: str):
-    """
-    Sum rounded hours per matter display_number within the cycle window.
-    Returns { display_number: total_hours }
-    """
-    url = f"{CLIO_API}/activities"
-    fields = "id,rounded_quantity,type,matter{id,display_number}"
     params = {
-        "start_date": start_iso,
-        "end_date": end_iso,
-        "status": "billable",
-        "fields": fields,
-        "order": "id(asc)",
-        "limit": PAGE_LIMIT
+        "start_date": start_iso, "end_date": end_iso, "status": "billable",
+        "fields": "id,rounded_quantity,type,matter{id,display_number}",
+        "order": "id(asc)", "limit": PAGE_LIMIT
     }
     totals = {}
-    entries = paginate(url, params)
-    for e in entries:
-        if e.get("type") != "TimeEntry":
-            continue
-        m = e.get("matter") or {}
-        dn = m.get("display_number")
-        if not dn:
-            continue
-        rq = e.get("rounded_quantity") or 0
-        try:
-            hours = float(rq) / 3600.0
-        except Exception:
-            hours = 0.0
-        totals[dn] = totals.get(dn, 0.0) + hours
+    for e in paginate(f"{CLIO_API}/activities", params):
+        if e.get("type") == "TimeEntry":
+            dn = (e.get("matter") or {}).get("display_number")
+            if dn:
+                try:
+                    totals[dn] = totals.get(dn, 0.0) + float(e.get("rounded_quantity", 0) or 0) / 3600.0
+                except Exception:
+                    pass
     return totals
 
 # ==============================
-# SharePoint upload
+# SharePoint helpers
 # ==============================
 def ensure_folder(path: str, headers: dict):
-    segments = path.strip("/").split("/")
     parent = ""
-    for seg in segments:
+    for seg in path.strip("/").split("/"):
         full = f"{parent}/{seg}" if parent else seg
-        url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{full}"
-        r = requests.get(url, headers=headers)
+        r = requests.get(
+            f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{full}",
+            headers=headers
+        )
         if r.status_code == 404:
             if parent:
-                create_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{parent}:/children"
+                create_url = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/"
+                              f"{SHAREPOINT_DRIVE_ID}/root:/{parent}:/children")
             else:
-                create_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root/children"
-            create = requests.post(create_url, headers=headers, json={
-                "name": seg,
-                "folder": {},
-                "@microsoft.graph.conflictBehavior": "replace"
-            })
-            create.raise_for_status()
+                create_url = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/"
+                              f"{SHAREPOINT_DRIVE_ID}/root/children")
+            requests.post(create_url, headers=headers, json={
+                "name": seg, "folder": {}, "@microsoft.graph.conflictBehavior": "replace"
+            }).raise_for_status()
         parent = full
 
 def upload_file(file_path: str, file_name: str, folder_path: str):
     authority = f"https://login.microsoftonline.com/{SHAREPOINT_TENANT_ID}"
     app = msal.ConfidentialClientApplication(
-        SHAREPOINT_CLIENT_ID,
-        authority=authority,
-        client_credential=SHAREPOINT_CLIENT_SECRET
+        SHAREPOINT_CLIENT_ID, authority=authority, client_credential=SHAREPOINT_CLIENT_SECRET
     )
     tok = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
     if "access_token" not in tok:
         raise Exception(f"Failed to get Graph token: {tok.get('error_description')}")
-    headers = {"Authorization": f"Bearer {tok['access_token']}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {tok['access_token']}"}
     ensure_folder(folder_path, headers)
-    encoded_path = quote(f"{folder_path}/{file_name}")
-    upload_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{encoded_path}:/content"
+    upload_url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}"
+        f"/root:/{quote(folder_path + '/' + file_name)}:/content"
+    )
     with open(file_path, "rb") as f:
-        res = requests.put(upload_url, headers={"Authorization": f"Bearer {tok['access_token']}"}, data=f)
+        res = requests.put(upload_url, headers=headers, data=f)
     if res.status_code not in (200, 201):
         raise Exception(f"Upload error: {res.status_code} - {res.text}")
-    print(f"✅ Uploaded {file_name} to SharePoint at {folder_path}/")
+    print(f"✅ Uploaded {file_name} to {folder_path}/")
 
 # ==============================
 # Report builder
 # ==============================
 def _resolve_cf_value(cf: dict, meta_by_name: dict) -> str:
-    """
-    Prefer picklist option text. If only numeric value is present for picklist,
-    translate via meta mapping. Otherwise use raw 'value'.
-    """
-    fname = cf.get("field_name")
-    ftype = cf.get("field_type")
-    if ftype == "picklist":
-        # Try nested option first
+    if cf.get("field_type") == "picklist":
         opt = (cf.get("picklist_option") or {}).get("option")
         if opt:
             return opt
-        # Fallback: map the numeric/string ID to text using meta
         raw = cf.get("value")
-        options = ((meta_by_name.get(fname) or {}).get("options")) or {}
-        if raw is not None and str(raw) in options:
-            return options[str(raw)] or ""
-        return str(raw or "")
-    # non-picklist
+        options = ((meta_by_name.get(cf.get("field_name")) or {}).get("options")) or {}
+        return options.get(str(raw), raw) or ""
     return str(cf.get("value") or "")
 
 def build_report_dataframe() -> pd.DataFrame:
-    # Meta for picklist translations
     cf_meta = fetch_custom_fields_meta()
-
-    # Base pulls
     matters = fetch_open_matters_with_cf()
     ocb = fetch_outstanding_client_balances()
     billable = fetch_billable_matters()
-
     start_iso, end_iso = cycle_iso(CYCLE_START_DATE, CYCLE_END_DATE, TIMEZONE_OFFSET)
     cycle_hours = fetch_cycle_hours(start_iso, end_iso)
 
-    # Build frames
     m_rows = []
     for m in matters:
-        # trust balances
         trust = 0.0
         for b in (m.get("account_balances") or []):
             try:
                 trust += float((b or {}).get("balance", 0) or 0)
             except Exception:
                 pass
-        # flatten custom fields into dict of {name: resolved_value}
         cf_map = {}
         for cf in (m.get("custom_field_values") or []):
-            if not isinstance(cf, dict):
-                continue
             name = cf.get("field_name")
             if not name:
                 continue
             cf_map[name] = _resolve_cf_value(cf, cf_meta)
-
-        display_number = m.get("display_number") or m.get("number") or ""
         m_rows.append({
             "Matter ID": m.get("id"),
-            "Matter Number": display_number,
+            "Matter Number": m.get("display_number") or m.get("number") or "",
             "Client ID": (m.get("client") or {}).get("id"),
             "Client Name": (m.get("client") or {}).get("name") or "",
             "Matter Stage": (m.get("matter_stage") or {}).get("name") or "",
@@ -402,28 +326,20 @@ def build_report_dataframe() -> pd.DataFrame:
         })
     matter_df = pd.DataFrame(m_rows)
 
-    # Outstanding per client
-    ocb_rows = []
-    for r in ocb:
-        ocb_rows.append({
-            "Client ID": (r.get("contact") or {}).get("id"),
-            "Outstanding Balance": r.get("total_outstanding_balance", 0) or 0
-        })
-    ocb_df = pd.DataFrame(ocb_rows)
+    ocb_df = pd.DataFrame([{
+        "Client ID": (r.get("contact") or {}).get("id"),
+        "Outstanding Balance": r.get("total_outstanding_balance", 0) or 0
+    } for r in ocb])
 
-    # Unbilled per matter
-    b_rows = []
-    for bm in billable:
-        b_rows.append({
-            "Matter ID": bm.get("id"),
-            "Matter Number": bm.get("display_number") or "",
-            "Client ID": (bm.get("client") or {}).get("id"),
-            "Unbilled Amount": bm.get("unbilled_amount", 0) or 0,
-            "Unbilled Hours": bm.get("unbilled_hours", 0) or 0
-        })
-    billable_df = pd.DataFrame(b_rows)
+    billable_df = pd.DataFrame([{
+        "Matter ID": bm.get("id"),
+        "Matter Number": bm.get("display_number") or "",
+        "Client ID": (bm.get("client") or {}).get("id"),
+        "Unbilled Amount": bm.get("unbilled_amount", 0) or 0,
+        "Unbilled Hours": bm.get("unbilled_hours", 0) or 0
+    } for bm in billable])
 
-    # Defensive columns
+    # Defensive fill
     for df, cols in [
         (matter_df, ["Matter ID","Matter Number","Client ID","Client Name","Matter Stage","Responsible Attorney","Trust Account Balance","_cf_map"]),
         (ocb_df, ["Client ID","Outstanding Balance"]),
@@ -433,27 +349,21 @@ def build_report_dataframe() -> pd.DataFrame:
             if c not in df.columns:
                 df[c] = 0 if ("Amount" in c or c.endswith("Balance")) else ({} if c == "_cf_map" else "")
 
-    # Merge (base = matters)
     combined = (
         matter_df
         .merge(ocb_df, on="Client ID", how="left")
         .merge(billable_df[["Matter ID","Unbilled Amount","Unbilled Hours"]], on="Matter ID", how="left")
     )
 
-    # Fill NaNs numerics
     for c in ["Trust Account Balance","Outstanding Balance","Unbilled Amount","Unbilled Hours"]:
-        if c in combined.columns:
-            combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
+        combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
 
-    # Net Trust Account Balance (same formula as traffic light)
     combined["Net Trust Account Balance"] = (
         combined["Trust Account Balance"] - combined["Outstanding Balance"] - combined["Unbilled Amount"]
     ).astype(float)
 
-    # Billing Cycle Hours from activities map (by display number)
     combined[BILLING_COL] = combined["Matter Number"].map(lambda dn: float(cycle_hours.get(dn, 0.0)))
 
-    # Build output rows in the exact OUTPUT_FIELDS order
     rows = []
     for _, r in combined.iterrows():
         cf = r.get("_cf_map", {}) or {}
@@ -465,9 +375,9 @@ def build_report_dataframe() -> pd.DataFrame:
             "Matter Stage": r.get("Matter Stage", ""),
             BILLING_COL: float(r.get(BILLING_COL, 0.0)),
             "Responsible Attorney": r.get("Responsible Attorney", ""),
-            "Main Paralegal": cf.get("Main Paralegal", ""),          # picklist option text
-            "Supporting Attorney": cf.get("Supporting Attorney", ""),# picklist option text
-            "Supporting Paralegal": cf.get("Supporting Paralegal", ""), # picklist option text
+            "Main Paralegal": cf.get("Main Paralegal", ""),
+            "Supporting Attorney": cf.get("Supporting Attorney", ""),
+            "Supporting Paralegal": cf.get("Supporting Paralegal", ""),
             "Client Notes": cf.get("Client Notes", ""),
             "Initial Client Goals": cf.get("Initial Client Goals", ""),
             "Initial Strategy": cf.get("Initial Strategy", ""),
@@ -487,37 +397,29 @@ def build_report_dataframe() -> pd.DataFrame:
         }
         rows.append(row)
 
-    df = pd.DataFrame(rows, columns=OUTPUT_FIELDS)
-
-    # Sort by Net Trust Account Balance (desc)
-    df = df.sort_values(by="Net Trust Account Balance", ascending=False, kind="mergesort").reset_index(drop=True)
-    return df
+    df_out = pd.DataFrame(rows, columns=OUTPUT_FIELDS)
+    df_out = df_out.sort_values(by="Net Trust Account Balance", ascending=False, kind="mergesort").reset_index(drop=True)
+    return df_out
 
 # ==============================
-# Excel writer (traffic-light formatting)
+# Excel writer
 # ==============================
 def write_excel(df: pd.DataFrame, file_path: str):
     wb = Workbook()
     ws = wb.active
     ws.title = "Case Review"
-
-    # Headers
     ws.append(list(df.columns))
-
-    # Rows
     for _, row in df.iterrows():
         ws.append([row.get(col, "") for col in df.columns])
 
     headers = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
-    net_col = headers.get("Net Trust Account Balance", None)
+    net_col = headers.get("Net Trust Account Balance")
 
-    # Styles (same as Traffic Light)
     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
     green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    bold_font = Font(bold=True)
+    _ = Font(bold=True)
 
-    # Currency / fills
     for r in range(2, ws.max_row + 1):
         if net_col:
             c = ws.cell(row=r, column=net_col)
@@ -533,67 +435,63 @@ def write_excel(df: pd.DataFrame, file_path: str):
             except Exception:
                 pass
 
-    # Add table styling
     ref = f"A1:{ws.cell(row=ws.max_row, column=ws.max_column).coordinate}"
     table = Table(displayName="CaseReviewTable", ref=ref)
-    style = TableStyleInfo(
-        name="TableStyleMedium9",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium9", showFirstColumn=False, showLastColumn=False,
+        showRowStripes=True, showColumnStripes=False
     )
-    table.tableStyleInfo = style
     ws.add_table(table)
 
     wb.save(file_path)
     print(f"✅ Saved Excel: {file_path}")
 
 # ==============================
-# NEW: Splitter helpers
+# Splitter
 # ==============================
-def _clean_attorney(s: str) -> str:
-    return (s or "").strip()
+def _last_name_key(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        return ""
+    if "," in name:
+        last = name.split(",")[0].strip()
+    else:
+        last = name.split()[-1].strip()
+    return last.lower()
 
 def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
-    # Ensure column exists
+    df = df.copy()
     if "Responsible Attorney" not in df.columns:
         print("⚠️ 'Responsible Attorney' column not found; skipping split.")
         return
+    df["_last_key"] = df["Responsible Attorney"].map(_last_name_key)
 
-    df = df.copy()
-    df["Responsible Attorney"] = df["Responsible Attorney"].map(_clean_attorney)
+    # Debug counts so you can verify name formats
+    try:
+        print("Responsible Attorney counts:\n", df["Responsible Attorney"].value_counts())
+    except Exception:
+        pass
 
-    for atty, folder in ATTORNEY_FOLDERS.items():
-        atty_df = df[df["Responsible Attorney"] == atty]
+    for last_key, folder in ATTORNEY_FOLDERS.items():
+        atty_df = df[df["_last_key"] == last_key]
         if atty_df.empty:
-            print(f"ℹ️ No rows for {atty}; skipping.")
+            print(f"ℹ️ No rows for {last_key.title()}; skipping.")
             continue
-
-        # File name: e.g., 250808.Case Review - Voorhees, Elizabeth.xlsx
-        atty_file_name = f"{file_date}.TESTCase Review - {atty}.xlsx"
-
-        # Write to /tmp and upload
-        tmp_dir = "/tmp"
-        os.makedirs(tmp_dir, exist_ok=True)
-        safe_stub = atty.replace(",", "").replace(" ", "_")
-        atty_file_path = os.path.join(tmp_dir, f"case_review_{safe_stub}.xlsx")
-
-        write_excel(atty_df, atty_file_path)
-        upload_file(atty_file_path, atty_file_name, folder)
-
+        display_name = ATTORNEY_DISPLAY[last_key]
+        file_name = f"TEST {file_date}.Case Review - {display_name}.xlsx"
+        tmp_path = os.path.join("/tmp", f"case_review_{last_key}.xlsx")
+        write_excel(atty_df, tmp_path)
+        upload_file(tmp_path, file_name, folder)
         try:
-            os.remove(atty_file_path)
+            os.remove(tmp_path)
         except Exception:
             pass
-
-        print(f"✅ Uploaded split file for {atty} → {folder}/{atty_file_name}")
+        print(f"✅ Uploaded split file for {display_name} → {folder}/{file_name}")
 
 # ==============================
-# Entrypoint: build + upload
+# Entrypoint
 # ==============================
 def extract_custom_data_and_build_file() -> tuple[pd.DataFrame, str]:
-    """Build the DataFrame, write the master Excel to /tmp, and return (df, path)."""
     df = build_report_dataframe()
     tmp_dir = "/tmp"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -603,17 +501,16 @@ def extract_custom_data_and_build_file() -> tuple[pd.DataFrame, str]:
 
 def main():
     df, file_path = extract_custom_data_and_build_file()
-
     file_date = datetime.now().strftime("%y%m%d")
-    master_name = f"{file_date}.TESTSeabrook's Case Review List.xlsx"
 
-    # 1) Upload the full master file to the Global Case Review List library/folder
+    # Master upload (TEST prefix)
+    master_name = f"TEST {file_date}.Seabrook's Case Review List.xlsx"
     upload_file(file_path, master_name, SHAREPOINT_DOC_LIB)
 
-    # 2) Split by attorney and upload to each attorney's folder
+    # Splits
     split_and_upload_by_attorney(df, file_date)
 
-    # Cleanup local temp
+    # Cleanup
     try:
         os.remove(file_path)
     except Exception:
