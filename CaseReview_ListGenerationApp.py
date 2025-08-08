@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Case Review Report (fixed)
+Case Review Report (fixed) + Splitter
 - Correct picklist names (no more numeric IDs for paralegals)
 - Adds Billing Cycle Hours (configurable date range) from Activities
 - Correct Net Trust Account Balance = Trust - Outstanding - Unbilled
 - Includes ALL open/pending matters
 - Same color formatting (traffic light) + sort by Net Trust desc
+- NEW: Splits master report into 4 Excel files by Responsible Attorney and uploads to each folder
 """
 
 import os
@@ -58,7 +59,19 @@ SHAREPOINT_CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
 SHAREPOINT_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET")
 SHAREPOINT_SITE_ID = os.getenv("SHAREPOINT_SITE_ID")
 SHAREPOINT_DRIVE_ID = os.getenv("SHAREPOINT_DRIVE_ID")
+
+# Master upload folder (unchanged)
 SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB", "General Management/Global Case Review Lists")
+
+# ==============================
+# NEW: Attorney -> SharePoint folder map for split uploads
+# ==============================
+ATTORNEY_FOLDERS = {
+    "Voorhees, Elizabeth": "Attorneys and Paralegals/Attorney Case Lists/Voorhees, Elizabeth",
+    "Darling, Craig":      "Attorneys and Paralegals/Attorney Case Lists/Darling, Craig",
+    "Huang, Lily":         "Attorneys and Paralegals/Attorney Case Lists/Huang, Lily",
+    "Parker, Gabriella":   "Attorneys and Paralegals/Attorney Case Lists/Parker, Gabriella",
+}
 
 # ==============================
 # Output columns (exact order you requested)
@@ -144,13 +157,16 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
         if resp.status_code == 429:
             ra = 30
             if resp.headers.get("Retry-After"):
-                try: ra = int(resp.headers["Retry-After"])
-                except ValueError: ra = 30
+                try:
+                    ra = int(resp.headers["Retry-After"])
+                except ValueError:
+                    ra = 30
             else:
                 try:
                     msg = (resp.json() or {}).get("error", {}).get("message", "")
                     m = re.search(r"Retry in (\d+)", msg)
-                    if m: ra = int(m.group(1))
+                    if m:
+                        ra = int(m.group(1))
                 except Exception:
                     pass
             print(f"[429] Rate limited. Waiting {ra}s …")
@@ -309,7 +325,6 @@ def upload_file(file_path: str, file_name: str, folder_path: str):
         raise Exception(f"Failed to get Graph token: {tok.get('error_description')}")
     headers = {"Authorization": f"Bearer {tok['access_token']}", "Content-Type": "application/json"}
     ensure_folder(folder_path, headers)
-    from urllib.parse import quote
     encoded_path = quote(f"{folder_path}/{file_name}")
     upload_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{encoded_path}:/content"
     with open(file_path, "rb") as f:
@@ -535,21 +550,70 @@ def write_excel(df: pd.DataFrame, file_path: str):
     print(f"✅ Saved Excel: {file_path}")
 
 # ==============================
+# NEW: Splitter helpers
+# ==============================
+def _clean_attorney(s: str) -> str:
+    return (s or "").strip()
+
+def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
+    # Ensure column exists
+    if "Responsible Attorney" not in df.columns:
+        print("⚠️ 'Responsible Attorney' column not found; skipping split.")
+        return
+
+    df = df.copy()
+    df["Responsible Attorney"] = df["Responsible Attorney"].map(_clean_attorney)
+
+    for atty, folder in ATTORNEY_FOLDERS.items():
+        atty_df = df[df["Responsible Attorney"] == atty]
+        if atty_df.empty:
+            print(f"ℹ️ No rows for {atty}; skipping.")
+            continue
+
+        # File name: e.g., 250808.Case Review - Voorhees, Elizabeth.xlsx
+        atty_file_name = f"{file_date}.Case Review - {atty}.xlsx"
+
+        # Write to /tmp and upload
+        tmp_dir = "/tmp"
+        os.makedirs(tmp_dir, exist_ok=True)
+        safe_stub = atty.replace(",", "").replace(" ", "_")
+        atty_file_path = os.path.join(tmp_dir, f"case_review_{safe_stub}.xlsx")
+
+        write_excel(atty_df, atty_file_path)
+        upload_file(atty_file_path, atty_file_name, folder)
+
+        try:
+            os.remove(atty_file_path)
+        except Exception:
+            pass
+
+        print(f"✅ Uploaded split file for {atty} → {folder}/{atty_file_name}")
+
+# ==============================
 # Entrypoint: build + upload
 # ==============================
-def extract_custom_data_and_build_file() -> str:
+def extract_custom_data_and_build_file() -> tuple[pd.DataFrame, str]:
+    """Build the DataFrame, write the master Excel to /tmp, and return (df, path)."""
     df = build_report_dataframe()
     tmp_dir = "/tmp"
     os.makedirs(tmp_dir, exist_ok=True)
-    file_path = os.path.join(tmp_dir, "case_review.xlsx")
+    file_path = os.path.join(tmp_dir, "case_review_master.xlsx")
     write_excel(df, file_path)
-    return file_path
+    return df, file_path
 
 def main():
-    file_path = extract_custom_data_and_build_file()
+    df, file_path = extract_custom_data_and_build_file()
+
     file_date = datetime.now().strftime("%y%m%d")
-    file_name = f"{file_date}.Seabrook's Case Review List.xlsx"
-    upload_file(file_path, file_name, SHAREPOINT_DOC_LIB)
+    master_name = f"{file_date}.Seabrook's Case Review List.xlsx"
+
+    # 1) Upload the full master file to the Global Case Review List library/folder
+    upload_file(file_path, master_name, SHAREPOINT_DOC_LIB)
+
+    # 2) Split by attorney and upload to each attorney's folder
+    split_and_upload_by_attorney(df, file_date)
+
+    # Cleanup local temp
     try:
         os.remove(file_path)
     except Exception:
