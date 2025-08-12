@@ -478,7 +478,7 @@ def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
             print(f"ℹ️ No rows for {last_key.title()}; skipping.")
             continue
         display_name = ATTORNEY_DISPLAY[last_key]
-        file_name = f"TEST {file_date}.Case Review - {display_name}.xlsx"
+        file_name = f"{file_date}.{display_name} Case Review List.xlsx"
         tmp_path = os.path.join("/tmp", f"case_review_{last_key}.xlsx")
         write_excel(atty_df, tmp_path)
         upload_file(tmp_path, file_name, folder)
@@ -504,7 +504,7 @@ def main():
     file_date = datetime.now().strftime("%y%m%d")
 
     # Master upload (TEST prefix)
-    master_name = f"TEST {file_date}.Seabrook's Case Review List.xlsx"
+    master_name = f"{file_date}.Seabrook's Case Review List.xlsx"
     upload_file(file_path, master_name, SHAREPOINT_DOC_LIB)
 
     # Splits
