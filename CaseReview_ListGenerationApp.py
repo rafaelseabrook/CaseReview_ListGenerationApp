@@ -358,8 +358,31 @@ def build_report_dataframe() -> pd.DataFrame:
     for c in ["Trust Account Balance","Outstanding Balance","Unbilled Amount","Unbilled Hours"]:
         combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
 
+    # ===== Allocate client-level Outstanding Balance to matters (proportional by Unbilled Amount; even split if all zero) =====
+    def _allocate_outstanding(group: pd.DataFrame) -> pd.DataFrame:
+        total_ocb = float(group["Outstanding Balance"].iloc[0] or 0.0)
+        if total_ocb == 0.0 or len(group) == 0:
+            group["Allocated OCB"] = 0.0
+            return group
+        ub = group["Unbilled Amount"].astype(float)
+        if ub.sum() > 0:
+            weights = ub / ub.sum()
+        else:
+            weights = pd.Series([1.0/len(group)]*len(group), index=group.index)
+        group["Allocated OCB"] = (total_ocb * weights).astype(float)
+        return group
+
+    combined = combined.groupby("Client ID", as_index=False, group_keys=False).apply(_allocate_outstanding)
+    if "Allocated OCB" not in combined.columns:
+        combined["Allocated OCB"] = 0.0
+    combined["Allocated OCB"] = combined["Allocated OCB"].fillna(0.0)
+
+    # Keep original client-level column for reference (name clarity)
+    combined.rename(columns={"Outstanding Balance": "Client Outstanding Balance"}, inplace=True)
+
+    # Updated Net Trust uses Allocated OCB (matter-level)
     combined["Net Trust Account Balance"] = (
-        combined["Trust Account Balance"] - combined["Outstanding Balance"] - combined["Unbilled Amount"]
+        combined["Trust Account Balance"] - combined["Allocated OCB"] - combined["Unbilled Amount"]
     ).astype(float)
 
     combined[BILLING_COL] = combined["Matter Number"].map(lambda dn: float(cycle_hours.get(dn, 0.0)))
