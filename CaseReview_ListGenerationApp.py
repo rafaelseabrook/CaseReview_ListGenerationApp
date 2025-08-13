@@ -4,6 +4,7 @@ Case Review Report (fixed) + Splitter (TEST MODE)
 - Adds 'TEST ' prefix to all uploaded filenames
 - Matches Responsible Attorneys by last name (handles 'First Last' and 'Last, First')
 - Keeps traffic-light formatting and SharePoint uploads
+- ✅ NEW: Computes WIP fallback from Activities (billable) when billable_matters lacks WIP, so drafts/pending are subtracted
 """
 
 import os
@@ -217,9 +218,7 @@ def fetch_outstanding_client_balances():
 
 def fetch_billable_matters():
     """
-    We’ll collect a comprehensive WIP figure per matter.
-    Try 'work_in_progress_amount' first; if missing, add up any of the commonly
-    seen components Clio returns when exposed: unbilled, pending/unapproved, draft.
+    Try to get a comprehensive WIP amount from billable_matters, if the tenant exposes it.
     """
     fields = (
         "id,display_number,client{id,name},"
@@ -228,48 +227,46 @@ def fetch_billable_matters():
     )
     return paginate(f"{CLIO_API}/billable_matters.json", {"fields": fields})
 
-# ==============================
-# SharePoint helpers
-# ==============================
-def ensure_folder(path: str, headers: dict):
-    parent = ""
-    for seg in path.strip("/").split("/"):
-        full = f"{parent}/{seg}" if parent else seg
-        r = requests.get(
-            f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}/root:/{full}",
-            headers=headers
-        )
-        if r.status_code == 404:
-            if parent:
-                create_url = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/"
-                              f"{SHAREPOINT_DRIVE_ID}/root:/{parent}:/children")
-            else:
-                create_url = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/"
-                              f"{SHAREPOINT_DRIVE_ID}/root/children")
-            requests.post(create_url, headers=headers, json={
-                "name": seg, "folder": {}, "@microsoft.graph.conflictBehavior": "replace"
-            }).raise_for_status()
-        parent = full
-
-def upload_file(file_path: str, file_name: str, folder_path: str):
-    authority = f"https://login.microsoftonline.com/{SHAREPOINT_TENANT_ID}"
-    app = msal.ConfidentialClientApplication(
-        SHAREPOINT_CLIENT_ID, authority=authority, client_credential=SHAREPOINT_CLIENT_SECRET
-    )
-    tok = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-    if "access_token" not in tok:
-        raise Exception(f"Failed to get Graph token: {tok.get('error_description')}")
-    headers = {"Authorization": f"Bearer {tok['access_token']}"}
-    ensure_folder(folder_path, headers)
-    upload_url = (
-        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}"
-        f"/root:/{quote(folder_path + '/' + file_name)}:/content"
-    )
-    with open(file_path, "rb") as f:
-        res = requests.put(upload_url, headers=headers, data=f)
-    if res.status_code not in (200, 201):
-        raise Exception(f"Upload error: {res.status_code} - {res.text}")
-    print(f"✅ Uploaded {file_name} to {folder_path}/")
+def fetch_wip_amounts_from_activities() -> dict:
+    """
+    Fallback WIP by summing 'total' across all billable Activities per matter (all time).
+    Keys by display_number.
+    """
+    url = f"{CLIO_API}/activities"
+    headers = {"Authorization": f"Bearer {_get_clio_token()}", "Accept": "application/json"}
+    params = {
+        "status": "billable",
+        "order": "id(asc)",
+        "limit": 200,
+        "fields": "id,total,type,matter{id,display_number}"
+    }
+    # page through
+    wip_by_dn: dict[str, float] = {}
+    next_url, next_params = url, dict(params)
+    while True:
+        resp = requests.get(next_url, headers=headers, params=next_params, timeout=60)
+        print(f"GET {next_url} params={next_params} → {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"Activities fallback error: {resp.status_code} {resp.text[:200]}")
+            break
+        body = resp.json() or {}
+        rows = body.get("data", []) or []
+        for a in rows:
+            m = a.get("matter") or {}
+            dn = m.get("display_number")
+            if not dn:
+                continue
+            try:
+                amt = float(a.get("total") or 0.0)
+            except Exception:
+                amt = 0.0
+            wip_by_dn[dn] = wip_by_dn.get(dn, 0.0) + amt
+        paging = (body.get("meta") or {}).get("paging") or {}
+        if paging.get("next"):
+            next_url, next_params = paging["next"], None
+            continue
+        break
+    return wip_by_dn
 
 # ==============================
 # Report builder
@@ -295,16 +292,9 @@ def build_report_dataframe() -> pd.DataFrame:
     matters = fetch_open_matters_with_cf()
     ocb = fetch_outstanding_client_balances()
     billable = fetch_billable_matters()
-    start_iso, end_iso = cycle_iso(CYCLE_START_DATE, CYCLE_END_DATE, TIMEZONE_OFFSET)
-    cycle_hours = {}
-    try:
-        # if you do not need per-user cycle hours on this report, keeping totals only is fine
-        # but we keep the total cycle hours column for continuity
-        from math import isfinite
-        # reuse fetch from activities for totals only if desired
-        pass
-    except Exception:
-        pass
+
+    # Fallback WIP from activities (covers drafts/pending)
+    wip_fallback_by_dn = fetch_wip_amounts_from_activities()
 
     # Build Matter base
     m_rows = []
@@ -335,14 +325,12 @@ def build_report_dataframe() -> pd.DataFrame:
         "Outstanding Balance": _num(r.get("total_outstanding_balance"))
     } for r in ocb])
 
-    # ===== Comprehensive WIP (includes drafts when exposed) =====
+    # WIP from billable_matters (prefer this if exposed)
     billable_df = []
     for bm in billable:
         wip = None
-        # Prefer explicit WIP from API if present
         if "work_in_progress_amount" in bm:
             wip = _num(bm.get("work_in_progress_amount"))
-        # Otherwise add known components if present
         parts = 0.0
         parts += _num(bm.get("unbilled_amount"))
         parts += _num(bm.get("pending_amount"))
@@ -350,14 +338,13 @@ def build_report_dataframe() -> pd.DataFrame:
         parts += _num(bm.get("draft_amount"))
         if wip is None:
             wip = parts
-        elif parts:  # safety: if both exist, use the larger (or you can choose to override)
+        elif parts:
             wip = max(wip, parts)
-
         billable_df.append({
             "Matter ID": bm.get("id"),
             "Matter Number": bm.get("display_number") or "",
             "Client ID": (bm.get("client") or {}).get("id"),
-            "WIP Amount": wip,
+            "WIP Amount_bm": wip,
             "Unbilled Hours": _num(bm.get("unbilled_hours")),
         })
     billable_df = pd.DataFrame(billable_df)
@@ -366,7 +353,7 @@ def build_report_dataframe() -> pd.DataFrame:
     for df, cols in [
         (matter_df, ["Matter ID","Matter Number","Client ID","Client Name","Matter Stage","Responsible Attorney","Trust Account Balance","_cf_map"]),
         (ocb_df, ["Client ID","Outstanding Balance"]),
-        (billable_df, ["Matter ID","Matter Number","WIP Amount","Unbilled Hours"]),
+        (billable_df, ["Matter ID","Matter Number","WIP Amount_bm","Unbilled Hours"]),
     ]:
         for c in cols:
             if c not in df.columns:
@@ -374,36 +361,27 @@ def build_report_dataframe() -> pd.DataFrame:
 
     # Correct merges:
     combined = matter_df.merge(ocb_df, on="Client ID", how="left")
-    # Join by Matter ID
-    combined = combined.merge(billable_df[["Matter ID","WIP Amount","Unbilled Hours"]], on="Matter ID", how="left")
+    combined = combined.merge(billable_df[["Matter ID","WIP Amount_bm","Unbilled Hours"]], on="Matter ID", how="left")
 
-    # Fallback by display_number for WIP in case ID didn’t match
-    fallback = billable_df[["Matter Number","WIP Amount","Unbilled Hours"]].rename(
-        columns={"WIP Amount": "WIP_by_dn", "Unbilled Hours": "Unbilled Hours_by_dn"}
-    )
-    combined = combined.merge(fallback, on="Matter Number", how="left")
+    # Fallback by display_number for WIP (activities-based)
+    combined["WIP Amount_act"] = combined["Matter Number"].map(lambda dn: _num(wip_fallback_by_dn.get(dn)))
 
-    for c in ["Trust Account Balance","Outstanding Balance","WIP Amount","Unbilled Hours","WIP_by_dn","Unbilled Hours_by_dn"]:
-        combined[c] = pd.to_numeric(combined.get(c), errors="coerce")
+    # Choose WIP: prefer billable_matters if it’s nonzero; otherwise activities fallback
+    combined["WIP Amount"] = combined["WIP Amount_bm"].fillna(0.0)
+    needs_fallback = combined["WIP Amount"] <= 0.0
+    combined.loc[needs_fallback, "WIP Amount"] = combined.loc[needs_fallback, "WIP Amount_act"].fillna(0.0)
 
-    # backfill WIP/Hours from display number when needed
-    need_amt = combined["WIP Amount"].isna()
-    combined.loc[need_amt, "WIP Amount"] = combined.loc[need_amt, "WIP_by_dn"]
-    need_hrs = combined["Unbilled Hours"].isna()
-    combined.loc[need_hrs, "Unbilled Hours"] = combined.loc[need_hrs, "Unbilled Hours_by_dn"]
-
-    combined.drop(columns=[c for c in ["WIP_by_dn","Unbilled Hours_by_dn"] if c in combined.columns], inplace=True)
-
+    # Coerce numerics / fill NA
     for c in ["Trust Account Balance","Outstanding Balance","WIP Amount","Unbilled Hours"]:
-        combined[c] = combined[c].fillna(0.0)
+        combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
 
-    # ✅ Net Trust per matter (subtract full WIP, including drafts)
+    # ✅ Net Trust per matter (subtract full WIP)
     combined["Net Trust Account Balance"] = (
         combined["Trust Account Balance"] - combined["Outstanding Balance"] - combined["WIP Amount"]
     ).astype(float)
 
-    # Cycle hours total column (kept for continuity; safe to leave 0.0 if you don’t need it)
-    combined[BILLING_COL] = combined["Matter Number"].map(lambda dn: float(cycle_hours.get(dn, 0.0)))
+    # Keep the cycle column (0.0 here unless you later wire hours)
+    combined[BILLING_COL] = 0.0
 
     # Build output rows
     rows = []
@@ -508,7 +486,6 @@ def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
         return
     df["_last_key"] = df["Responsible Attorney"].map(_last_name_key)
 
-    # Debug counts so you can verify name formats
     try:
         print("Responsible Attorney counts:\n", df["Responsible Attorney"].value_counts())
     except Exception:
@@ -540,6 +517,26 @@ def extract_custom_data_and_build_file() -> tuple[pd.DataFrame, str]:
     file_path = os.path.join(tmp_dir, "case_review_master.xlsx")
     write_excel(df, file_path)
     return df, file_path
+
+def upload_file(file_path: str, file_name: str, folder_path: str):
+    authority = f"https://login.microsoftonline.com/{SHAREPOINT_TENANT_ID}"
+    app = msal.ConfidentialClientApplication(
+        SHAREPOINT_CLIENT_ID, authority=authority, client_credential=SHAREPOINT_CLIENT_SECRET
+    )
+    tok = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+    if "access_token" not in tok:
+        raise Exception(f"Failed to get Graph token: {tok.get('error_description')}")
+    headers = {"Authorization": f"Bearer {tok['access_token']}"}
+    ensure_folder(folder_path, headers)
+    upload_url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/drives/{SHAREPOINT_DRIVE_ID}"
+        f"/root:/{quote(folder_path + '/' + file_name)}:/content"
+    )
+    with open(file_path, "rb") as f:
+        res = requests.put(upload_url, headers=headers, data=f)
+    if res.status_code not in (200, 201):
+        raise Exception(f"Upload error: {res.status_code} - {res.text}")
+    print(f"✅ Uploaded {file_name} to {folder_path}/")
 
 def main():
     df, file_path = extract_custom_data_and_build_file()
