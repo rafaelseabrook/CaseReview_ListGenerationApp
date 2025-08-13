@@ -192,6 +192,18 @@ def paginate(url: str, params: dict | None = None):
     return all_rows
 
 # ==============================
+# Name normalization (match your earlier script)
+# ==============================
+def _normalize_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        return ""
+    if "," in name:
+        last, first = name.split(",", 1)
+        return f"{first.strip()} {last.strip()}"
+    return name
+
+# ==============================
 # Clio fetchers
 # ==============================
 def fetch_custom_fields_meta():
@@ -318,7 +330,7 @@ def build_report_dataframe() -> pd.DataFrame:
             "Matter ID": m.get("id"),
             "Matter Number": m.get("display_number") or m.get("number") or "",
             "Client ID": (m.get("client") or {}).get("id"),
-            "Client Name": (m.get("client") or {}).get("name") or "",
+            "Client Name": _normalize_name((m.get("client") or {}).get("name") or ""),
             "Matter Stage": (m.get("matter_stage") or {}).get("name") or "",
             "Responsible Attorney": (m.get("responsible_attorney") or {}).get("name") or "",
             "Trust Account Balance": trust,
@@ -326,8 +338,9 @@ def build_report_dataframe() -> pd.DataFrame:
         })
     matter_df = pd.DataFrame(m_rows)
 
+    # --- Merge OCB by Client Name (normalized) like your working script ---
     ocb_df = pd.DataFrame([{
-        "Client ID": (r.get("contact") or {}).get("id"),
+        "Client Name": _normalize_name((r.get("contact") or {}).get("name") or ""),
         "Outstanding Balance": r.get("total_outstanding_balance", 0) or 0
     } for r in ocb])
 
@@ -342,47 +355,26 @@ def build_report_dataframe() -> pd.DataFrame:
     # Defensive fill
     for df, cols in [
         (matter_df, ["Matter ID","Matter Number","Client ID","Client Name","Matter Stage","Responsible Attorney","Trust Account Balance","_cf_map"]),
-        (ocb_df, ["Client ID","Outstanding Balance"]),
+        (ocb_df, ["Client Name","Outstanding Balance"]),
         (billable_df, ["Matter ID","Unbilled Amount","Unbilled Hours"]),
     ]:
         for c in cols:
             if c not in df.columns:
                 df[c] = 0 if ("Amount" in c or c.endswith("Balance")) else ({} if c == "_cf_map" else "")
 
+    # Join OCB by Client Name, Unbilled by Matter ID
     combined = (
         matter_df
-        .merge(ocb_df, on="Client ID", how="left")
+        .merge(ocb_df, on="Client Name", how="left")
         .merge(billable_df[["Matter ID","Unbilled Amount","Unbilled Hours"]], on="Matter ID", how="left")
     )
 
     for c in ["Trust Account Balance","Outstanding Balance","Unbilled Amount","Unbilled Hours"]:
         combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
 
-    # ===== Allocate client-level Outstanding Balance to matters (proportional by Unbilled Amount; even split if all zero) =====
-    def _allocate_outstanding(group: pd.DataFrame) -> pd.DataFrame:
-        total_ocb = float(group["Outstanding Balance"].iloc[0] or 0.0)
-        if total_ocb == 0.0 or len(group) == 0:
-            group["Allocated OCB"] = 0.0
-            return group
-        ub = group["Unbilled Amount"].astype(float)
-        if ub.sum() > 0:
-            weights = ub / ub.sum()
-        else:
-            weights = pd.Series([1.0/len(group)]*len(group), index=group.index)
-        group["Allocated OCB"] = (total_ocb * weights).astype(float)
-        return group
-
-    combined = combined.groupby("Client ID", as_index=False, group_keys=False).apply(_allocate_outstanding)
-    if "Allocated OCB" not in combined.columns:
-        combined["Allocated OCB"] = 0.0
-    combined["Allocated OCB"] = combined["Allocated OCB"].fillna(0.0)
-
-    # Keep original client-level column for reference (name clarity)
-    combined.rename(columns={"Outstanding Balance": "Client Outstanding Balance"}, inplace=True)
-
-    # Updated Net Trust uses Allocated OCB (matter-level)
+    # Net Trust = Trust - (full client Outstanding) - Unbilled (no allocation)
     combined["Net Trust Account Balance"] = (
-        combined["Trust Account Balance"] - combined["Allocated OCB"] - combined["Unbilled Amount"]
+        combined["Trust Account Balance"] - combined["Outstanding Balance"] - combined["Unbilled Amount"]
     ).astype(float)
 
     combined[BILLING_COL] = combined["Matter Number"].map(lambda dn: float(cycle_hours.get(dn, 0.0)))
