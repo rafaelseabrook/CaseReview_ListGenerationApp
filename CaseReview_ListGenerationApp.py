@@ -21,10 +21,10 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 # ==============================
 # Config (billing cycle)
 # ==============================
-CYCLE_START_LABEL = "07/02/25"
-CYCLE_END_LABEL   = "07/15/25"
-CYCLE_START_DATE  = "2025-07-02"
-CYCLE_END_DATE    = "2025-07-15"
+CYCLE_START_LABEL = "07/29/25"
+CYCLE_END_LABEL   = "08/12/25"
+CYCLE_START_DATE  = "2025-07-29"
+CYCLE_END_DATE    = "2025-08-12"
 TIMEZONE_OFFSET   = os.getenv("CLIO_TZ_OFFSET", "-08:00")
 
 def cycle_iso(start_date: str, end_date: str, tz: str) -> tuple[str, str]:
