@@ -216,8 +216,11 @@ def fetch_outstanding_client_balances():
                     {"fields": "contact{id,name},total_outstanding_balance"})
 
 def fetch_billable_matters():
-    return paginate(f"{CLIO_API}/billable_matters.json",
-                    {"fields": "id,display_number,client{id,name},unbilled_amount,unbilled_hours"})
+    # ⬅️ include ID + DISPLAY NUMBER so we can key by Matter Number
+    return paginate(
+        f"{CLIO_API}/billable_matters.json",
+        {"fields": "id,display_number,client{id,name},unbilled_amount,unbilled_hours"}
+    )
 
 def fetch_cycle_hours(start_iso: str, end_iso: str):
     params = {
@@ -331,6 +334,7 @@ def build_report_dataframe() -> pd.DataFrame:
         "Outstanding Balance": r.get("total_outstanding_balance", 0) or 0
     } for r in ocb])
 
+    # ✅ Key work-in-progress by Matter Number (display_number)
     billable_df = pd.DataFrame([{
         "Matter ID": bm.get("id"),
         "Matter Number": bm.get("display_number") or "",
@@ -339,39 +343,48 @@ def build_report_dataframe() -> pd.DataFrame:
         "Unbilled Hours": bm.get("unbilled_hours", 0) or 0
     } for bm in billable])
 
-    # ---------- NEW: enforce matching dtypes for merge keys (prevents missed joins) ----------
-    for df, key in [(matter_df, "Client ID"), (ocb_df, "Client ID")]:
-        if key in df.columns:
-            df[key] = pd.to_numeric(df[key], errors="coerce").astype("Int64")
-
-    for df, key in [(matter_df, "Matter ID"), (billable_df, "Matter ID")]:
-        if key in df.columns:
-            df[key] = pd.to_numeric(df[key], errors="coerce").astype("Int64")
-    # -----------------------------------------------------------------------------------------
-
     # Defensive fill
     for df, cols in [
         (matter_df, ["Matter ID","Matter Number","Client ID","Client Name","Matter Stage","Responsible Attorney","Trust Account Balance","_cf_map"]),
         (ocb_df, ["Client ID","Outstanding Balance"]),
-        (billable_df, ["Matter ID","Unbilled Amount","Unbilled Hours"]),
+        (billable_df, ["Matter ID","Matter Number","Unbilled Amount","Unbilled Hours"]),
     ]:
         for c in cols:
             if c not in df.columns:
-                df[c] = 0 if ("Amount" in c or c.endswith("Balance")) else ({} if c == "_cf_map" else "")
+                df[c] = 0 if ("Amount" in c or c.endswith("Balance") or c.endswith("Hours")) else ({} if c == "_cf_map" else "")
 
-    combined = (
-        matter_df
-        .merge(ocb_df, on="Client ID", how="left")  # join OCB by Client ID (no allocation)
-        .merge(billable_df[["Matter ID","Unbilled Amount","Unbilled Hours"]], on="Matter ID", how="left")
+    # === Correct merges ===
+    # 1) OCB by Client ID (safe)
+    combined = matter_df.merge(ocb_df, on="Client ID", how="left")
+    # 2) WIP by Matter ID, with fallback by Matter Number to catch display_number-only matches
+    combined = combined.merge(billable_df[["Matter ID","Unbilled Amount","Unbilled Hours"]], on="Matter ID", how="left")
+
+    # Fallback by display_number
+    fallback = billable_df[["Matter Number","Unbilled Amount","Unbilled Hours"]].rename(
+        columns={"Unbilled Amount": "Unbilled Amount_by_dn", "Unbilled Hours": "Unbilled Hours_by_dn"}
     )
+    combined = combined.merge(fallback, on="Matter Number", how="left")
+
+    # Numerics + backfill
+    for c in ["Trust Account Balance","Outstanding Balance","Unbilled Amount","Unbilled Hours","Unbilled Amount_by_dn","Unbilled Hours_by_dn"]:
+        combined[c] = pd.to_numeric(combined.get(c), errors="coerce")
+
+    need_fill_amt = combined["Unbilled Amount"].isna() | (combined["Unbilled Amount"] == 0)
+    combined.loc[need_fill_amt, "Unbilled Amount"] = combined.loc[need_fill_amt, "Unbilled Amount_by_dn"]
+    need_fill_hrs = combined["Unbilled Hours"].isna() | (combined["Unbilled Hours"] == 0)
+    combined.loc[need_fill_hrs, "Unbilled Hours"] = combined.loc[need_fill_hrs, "Unbilled Hours_by_dn"]
+
+    combined.drop(columns=[c for c in ["Unbilled Amount_by_dn","Unbilled Hours_by_dn"] if c in combined.columns], inplace=True)
 
     for c in ["Trust Account Balance","Outstanding Balance","Unbilled Amount","Unbilled Hours"]:
-        combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
+        combined[c] = combined[c].fillna(0.0)
 
+    # ✅ Correct Net Trust per matter
     combined["Net Trust Account Balance"] = (
         combined["Trust Account Balance"] - combined["Outstanding Balance"] - combined["Unbilled Amount"]
     ).astype(float)
 
+    # Cycle hours total
     combined[BILLING_COL] = combined["Matter Number"].map(lambda dn: float(cycle_hours.get(dn, 0.0)))
 
     rows = []
@@ -488,7 +501,7 @@ def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
             print(f"ℹ️ No rows for {last_key.title()}; skipping.")
             continue
         display_name = ATTORNEY_DISPLAY[last_key]
-        file_name = f"{file_date}.{display_name} Case Review List.xlsx"
+        file_name = f"TEST {file_date}.Case Review - {display_name}.xlsx"
         tmp_path = os.path.join("/tmp", f"case_review_{last_key}.xlsx")
         write_excel(atty_df, tmp_path)
         upload_file(tmp_path, file_name, folder)
@@ -514,7 +527,7 @@ def main():
     file_date = datetime.now().strftime("%y%m%d")
 
     # Master upload (TEST prefix)
-    master_name = f"{file_date}.Seabrook's Case Review List.xlsx"
+    master_name = f"TEST {file_date}.Seabrook's Case Review List.xlsx"
     upload_file(file_path, master_name, SHAREPOINT_DOC_LIB)
 
     # Splits
