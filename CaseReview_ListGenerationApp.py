@@ -1,11 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Case Review Report (Traffic-Light parity)
-- Net Trust = Trust (matter) - Outstanding (client) - Unbilled Amount (client)
-- Matches Traffic Light logic by merging on normalized Client Name
-- Keeps Excel formatting, SharePoint upload, and per-attorney splits
-"""
-
 import os
 import re
 import time
@@ -423,7 +415,7 @@ def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
             print(f"ℹ️ No rows for {last_key.title()}; skipping.")
             continue
         display_name = ATTORNEY_DISPLAY[last_key]
-        file_name = f"{file_date}.Case Review - {display_name}.xlsx"
+        file_name = f"{file_date}.{display_name} Case Review List.xlsx"
         tmp_path = os.path.join("/tmp", f"case_review_{last_key}.xlsx")
         write_excel(atty_df, tmp_path)
         upload_file(tmp_path, file_name, folder)
