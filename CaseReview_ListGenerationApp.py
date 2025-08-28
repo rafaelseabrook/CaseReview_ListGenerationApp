@@ -44,19 +44,27 @@ SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB", "General Management/Global 
 
 # ==============================
 # Attorney folder mapping (by last name)
+# Use these for exceptions or custom folder names.
+# Everyone else will be handled automatically by the smart splitter.
 # ==============================
 ATTORNEY_FOLDERS = {
     "voorhees": "Attorneys and Paralegals/Attorney Case Lists/Voorhees, Elizabeth",
     "darling":  "Attorneys and Paralegals/Attorney Case Lists/Darling, Craig",
     "huang":    "Attorneys and Paralegals/Attorney Case Lists/Huang, Lily",
     "parker":   "Attorneys and Paralegals/Attorney Case Lists/Parker, Gabriella",
+    # Optional: add overrides here if needed, e.g.:
+    # "kirsten": "Attorneys and Paralegals/Attorney Case Lists/Kirsten, Natalie",
 }
 ATTORNEY_DISPLAY = {
     "voorhees": "Voorhees, Elizabeth",
     "darling":  "Darling, Craig",
     "huang":    "Huang, Lily",
     "parker":   "Parker, Gabriella",
+    # "kirsten":  "Kirsten, Natalie",
 }
+
+# Base for automatically derived folders
+BASE_ATTY_FOLDER = "Attorneys and Paralegals/Attorney Case Lists"
 
 # ==============================
 # Output columns
@@ -193,6 +201,23 @@ def _normalize_name(name: str) -> str:
         return f"{first.strip()} {last.strip()}"
     return name
 
+def _to_last_first(name: str) -> str:
+    """
+    Convert 'First Middle Last' or 'Last, First Middle' to 'Last, First Middle'
+    """
+    name = (name or "").strip()
+    if not name:
+        return ""
+    if "," in name:
+        last, first = [p.strip() for p in name.split(",", 1)]
+        return f"{last}, {first}"
+    parts = name.split()
+    if len(parts) == 1:
+        return parts[0]
+    first = " ".join(parts[:-1])
+    last = parts[-1]
+    return f"{last}, {first}"
+
 # ==============================
 # Clio fetchers
 # ==============================
@@ -216,18 +241,12 @@ def fetch_open_matters_with_cf():
 def fetch_outstanding_client_balances():
     rows = paginate(f"{CLIO_API}/outstanding_client_balances.json",
                     {"fields": "contact{id,name},total_outstanding_balance"})
-    # Normalize client names to match the matters list
     return [{
         "Client Name": _normalize_name((r.get("contact") or {}).get("name") or ""),
         "Outstanding Balance": _num(r.get("total_outstanding_balance"))
     } for r in rows]
 
 def fetch_billable_matters_client_unbilled():
-    """
-    EXACTLY like your Traffic Light report:
-    - Request only valid fields to avoid 400s
-    - Aggregate Unbilled Amount/Hours by normalized Client Name
-    """
     rows = paginate(f"{CLIO_API}/billable_matters.json",
                     {"fields": "id,display_number,client{name},unbilled_amount,unbilled_hours"})
     agg: dict[str, dict] = {}
@@ -294,7 +313,7 @@ def build_report_dataframe() -> pd.DataFrame:
         })
     matter_df = pd.DataFrame(m_rows)
 
-    ocb_df = pd.DataFrame(ocb_rows)  # Client Name + Outstanding Balance
+    ocb_df = pd.DataFrame(ocb_rows)          # Client Name + Outstanding Balance
     unbilled_df = pd.DataFrame(unbilled_rows)  # Client Name + Unbilled Amount/Hours
 
     # Defensive columns
@@ -385,7 +404,7 @@ def write_excel(df: pd.DataFrame, file_path: str):
     print(f"✅ Saved Excel: {file_path}")
 
 # ==============================
-# Splitter
+# Splitter (SMART)
 # ==============================
 def _last_name_key(name: str) -> str:
     name = (name or "").strip()
@@ -398,10 +417,17 @@ def _last_name_key(name: str) -> str:
     return last.lower()
 
 def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
+    """
+    Smart behavior:
+    - Iterate over every attorney present in the data (by last-name key).
+    - Prefer explicit ATTORNEY_* mappings; otherwise derive display/folder as 'Last, First'.
+    - Upload to SharePoint; folders are created if missing.
+    """
     df = df.copy()
     if "Responsible Attorney" not in df.columns:
         print("⚠️ 'Responsible Attorney' column not found; skipping split.")
         return
+
     df["_last_key"] = df["Responsible Attorney"].map(_last_name_key)
 
     try:
@@ -409,20 +435,36 @@ def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
     except Exception:
         pass
 
-    for last_key, folder in ATTORNEY_FOLDERS.items():
+    seen = set()
+    for last_key in sorted(k for k in df["_last_key"].unique() if k):
+        if last_key in seen:
+            continue
+        seen.add(last_key)
+
         atty_df = df[df["_last_key"] == last_key]
         if atty_df.empty:
-            print(f"ℹ️ No rows for {last_key.title()}; skipping.")
             continue
-        display_name = ATTORNEY_DISPLAY[last_key]
+
+        # Prefer explicit display override; else derive from the first full name encountered
+        display_name = ATTORNEY_DISPLAY.get(last_key)
+        if not display_name:
+            sample_name = atty_df["Responsible Attorney"].iloc[0]
+            display_name = _to_last_first(sample_name)
+
+        # Prefer explicit folder override; else derive default folder path
+        folder = ATTORNEY_FOLDERS.get(last_key) or f"{BASE_ATTY_FOLDER}/{display_name}"
+
         file_name = f"{file_date}.{display_name} Case Review List.xlsx"
         tmp_path = os.path.join("/tmp", f"case_review_{last_key}.xlsx")
+
         write_excel(atty_df, tmp_path)
         upload_file(tmp_path, file_name, folder)
+
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+
         print(f"✅ Uploaded split file for {display_name} → {folder}/{file_name}")
 
 # ==============================
@@ -445,7 +487,8 @@ def upload_file(file_path: str, file_name: str, folder_path: str):
     if "access_token" not in tok:
         raise Exception(f"Failed to get Graph token: {tok.get('error_description')}")
     headers = {"Authorization": f"Bearer {tok['access_token']}"}
-    # Ensure folder path exists
+
+    # Ensure folder path exists (create if missing)
     parent = ""
     for seg in folder_path.strip("/").split("/"):
         full = f"{parent}/{seg}" if parent else seg
@@ -483,7 +526,7 @@ def main():
     master_name = f"{file_date}.Seabrook's Case Review List.xlsx"
     upload_file(file_path, master_name, SHAREPOINT_DOC_LIB)
 
-    # Splits
+    # Splits (smart)
     split_and_upload_by_attorney(df, file_date)
 
     # Cleanup
