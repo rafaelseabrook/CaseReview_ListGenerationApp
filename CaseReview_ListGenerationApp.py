@@ -13,8 +13,8 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 # ==============================
 # Config (billing cycle label only; hours not used here)
 # ==============================
-CYCLE_START_LABEL = "11/19/25"
-CYCLE_END_LABEL   = "12/02/25"
+CYCLE_START_LABEL = "12/03/25"
+CYCLE_END_LABEL   = "12/16/25"
 BILLING_COL = f"Billing Cycle Hours ({CYCLE_START_LABEL} - {CYCLE_END_LABEL})"
 
 # ==============================
