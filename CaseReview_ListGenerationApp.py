@@ -72,10 +72,18 @@ BASE_ATTY_FOLDER = "Attorneys and Paralegals/Attorney Case Lists"
 OUTPUT_FIELDS = [
     "Matter Number","Client Name","CR ID","Net Trust Account Balance","Matter Stage",
     BILLING_COL,
-    "Responsible Attorney","Main Paralegal","Supporting Attorney","Supporting Paralegal","Client Notes",
-    "Initial Client Goals","Initial Strategy","Has strategy changed Describe","Current action Items",
-    "Hearings","Deadlines","DV situation description","Custody Visitation","CS Add ons Extracurricular",
-    "Spousal Support","PDDs","Discovery","Judgment Trial","Post Judgment","collection efforts"
+    "Responsible Attorney","Main Paralegal","Supporting Attorney","Supporting Paralegal",
+    "Client Goals","Strategy","Has strategy changed Describe","Detailed List of Issues in the Case",
+    "Strategy to Resolve Issues in the Case","Current action Items","Client Notes",
+    "All Hearings on Calendar","All Deadlines on Calendar",
+    "DVRO: Attorney Action Required? Please Describe",
+    "Custody & Visitation: Temp Orders Needed? State Current Order",
+    "Child Support: Temporary Orders Needed? State Current Order",
+    "PDDs: Status of PDDs and OPPs PDDs",
+    "Formal Discovery: Outline Discovery Strategy",
+    "Parentage / Dissolution of Marriage / Legal Separation:",
+    "Judgment: Has a Judgement Been Entered? Please Specify",
+    "Unbilled Hours"
 ]
 
 # ==============================
@@ -268,10 +276,17 @@ def fetch_billable_matters_client_unbilled():
 # Report builder
 # ==============================
 CF_OUTPUT_FIELDS = [
-    "CR ID","Main Paralegal","Supporting Attorney","Supporting Paralegal","Client Notes",
-    "Initial Client Goals","Initial Strategy","Has strategy changed Describe","Current action Items",
-    "Hearings","Deadlines","DV situation description","Custody Visitation","CS Add ons Extracurricular",
-    "Spousal Support","PDDs","Discovery","Judgment Trial","Post Judgment","collection efforts"
+    "CR ID","Main Paralegal","Supporting Attorney","Supporting Paralegal",
+    "Client Goals","Strategy","Has strategy changed Describe","Detailed List of Issues in the Case",
+    "Strategy to Resolve Issues in the Case","Current action Items","Client Notes",
+    "All Hearings on Calendar","All Deadlines on Calendar",
+    "DVRO: Attorney Action Required? Please Describe",
+    "Custody & Visitation: Temp Orders Needed? State Current Order",
+    "Child Support: Temporary Orders Needed? State Current Order",
+    "PDDs: Status of PDDs and OPPs PDDs",
+    "Formal Discovery: Outline Discovery Strategy",
+    "Parentage / Dissolution of Marriage / Legal Separation:",
+    "Judgment: Has a Judgement Been Entered? Please Specify"
 ]
 
 def _resolve_cf_value(cf: dict, meta_by_name: dict) -> str:
@@ -457,7 +472,9 @@ def split_and_upload_by_attorney(df: pd.DataFrame, file_date: str):
         file_name = f"{file_date}.{display_name} Case Review List.xlsx"
         tmp_path = os.path.join("/tmp", f"case_review_{last_key}.xlsx")
 
-        write_excel(atty_df, tmp_path)
+        # Drop _last_key before writing to Excel
+        atty_df_clean = atty_df.drop(columns=["_last_key"], errors="ignore")
+        write_excel(atty_df_clean, tmp_path)
         upload_file(tmp_path, file_name, folder)
 
         try:
