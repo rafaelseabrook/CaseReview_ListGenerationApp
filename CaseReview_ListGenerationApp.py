@@ -400,7 +400,7 @@ def write_excel(df: pd.DataFrame, file_path: str):
                 val = float(c.value or 0)
                 if val <= 0:
                     c.fill = red_fill
-                elif 0 < val < 1000:
+                elif 0 < val <= 2000:
                     c.fill = yellow_fill
                 else:
                     c.fill = green_fill
