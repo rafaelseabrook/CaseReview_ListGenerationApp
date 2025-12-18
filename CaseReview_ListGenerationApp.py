@@ -70,7 +70,9 @@ BASE_ATTY_FOLDER = "Attorneys and Paralegals/Attorney Case Lists"
 # Output columns
 # ==============================
 OUTPUT_FIELDS = [
-    "Matter Number","Client Name","CR ID","Net Trust Account Balance","Matter Stage",
+    "Matter Number","Client Name","CR ID","Net Trust Account Balance",
+    "Parentage / Dissolution of Marriage / Legal Separation:",
+    "Matter Stage",
     BILLING_COL,
     "Responsible Attorney","Main Paralegal","Supporting Attorney","Supporting Paralegal",
     "Client Goals","Strategy","Has strategy changed Describe","Detailed List of Issues in the Case",
@@ -81,7 +83,6 @@ OUTPUT_FIELDS = [
     "Child Support: Temporary Orders Needed? State Current Order",
     "PDDs: Status of PDDs and OPPs PDDs",
     "Formal Discovery: Outline Discovery Strategy",
-    "Parentage / Dissolution of Marriage / Legal Separation:",
     "Judgment: Has a Judgement Been Entered? Please Specify",
     "Unbilled Hours"
 ]
@@ -276,7 +277,8 @@ def fetch_billable_matters_client_unbilled():
 # Report builder
 # ==============================
 CF_OUTPUT_FIELDS = [
-    "CR ID","Main Paralegal","Supporting Attorney","Supporting Paralegal",
+    "Parentage / Dissolution of Marriage / Legal Separation:",
+    "Main Paralegal","Supporting Attorney","Supporting Paralegal",
     "Client Goals","Strategy","Has strategy changed Describe","Detailed List of Issues in the Case",
     "Strategy to Resolve Issues in the Case","Current action Items","Client Notes",
     "All Hearings on Calendar","All Deadlines on Calendar",
@@ -285,7 +287,6 @@ CF_OUTPUT_FIELDS = [
     "Child Support: Temporary Orders Needed? State Current Order",
     "PDDs: Status of PDDs and OPPs PDDs",
     "Formal Discovery: Outline Discovery Strategy",
-    "Parentage / Dissolution of Marriage / Legal Separation:",
     "Judgment: Has a Judgement Been Entered? Please Specify"
 ]
 
