@@ -4,6 +4,7 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime
+import pytz
 from urllib.parse import quote
 import msal
 from openpyxl import Workbook
@@ -538,7 +539,10 @@ def upload_file(file_path: str, file_name: str, folder_path: str):
 
 def main():
     df, file_path = extract_custom_data_and_build_file()
-    file_date = datetime.now().strftime("%y%m%d")
+    # Use Pacific time for file naming
+    pacific_tz = pytz.timezone('America/Los_Angeles')
+    pacific_time = datetime.now(pacific_tz)
+    file_date = pacific_time.strftime("%y%m%d_%H%M%S")
 
     # Master upload
     master_name = f"{file_date}.Seabrook's Case Review List.xlsx"
